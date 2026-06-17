@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# AEROS output files (large, generated)
+*.xpost
+*.xpost.*
+
+# Gmsh
+*.msh
+
+# VTK / ParaView output
+*.vtk
+
+# Data files (add paths to large mesh files here)
+# data/*.fem
