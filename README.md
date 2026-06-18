@@ -1,6 +1,6 @@
 # AeroOrigami
 
-Python library for setting up origami-inspired parachute folding simulations in AERO-S.
+Python library for setting up origami-inspired parachute (or other deployable structure) folding simulations in AERO-S.
 
 Given a high-fidelity parachute mesh and a crease pattern, AeroOrigami generates all
 AERO-S input files needed to simulate the fold. After the simulation runs, it maps
@@ -33,15 +33,19 @@ the post-fold displacement mapping step.
 
 ## Crease pattern CSV format
 
-Each CSV has one row per fold line:
+Each CSV has one row per fold line segment:
 
 ```
-x1, y1, z1, x2, y2, z2, type, angle
+x1, y1, z1, x2, y2, z2, angle, type
 ```
 
-- `x1,y1,z1` and `x2,y2,z2` are the 3D endpoints of the fold line (meters)
-- `type` is `M` (mountain) or `V` (valley)
-- `angle` is the target fold angle in radians (positive for mountain, negative for valley)
+- `x1,y1,z1` and `x2,y2,z2` are the 3D endpoints of the line segment (meters)
+- `angle` is the target fold angle in radians — positive = mountain, negative = valley
+- `type` is `C` (crease fold) or `B` (boundary edge — no folding, used to identify
+  the perimeter of the crease region)
+
+You can supply any number of CSV files to `load_creases()`; a typical case is one
+file for the disk and one for the band.
 
 ## Project structure
 
