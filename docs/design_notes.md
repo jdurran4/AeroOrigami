@@ -6,19 +6,40 @@ Rationale behind key technical decisions. Update this when a decision changes.
 
 ## Crease pattern input format
 
-**Decision:** Two CSV files (disk + band), one row per fold, columns:
-`x1, y1, z1, x2, y2, z2, type, angle`
+**Decision:** One or more CSV files, one row per line segment, columns:
+`x1, y1, z1, x2, y2, z2, angle, type`
+where `type = C` (crease) or `B` (boundary), and `angle` sign encodes
+mountain (positive) vs. valley (negative).
 
-**Why:** The prototype used 6–8 separate CSV files per region because the schema
-grew organically over a year of research. A single file per region with a consistent
-column schema reduces the reader to one function and makes it obvious what data is
-required. CSV was kept (over JSON/YAML/FOLD format) because researchers generating
-crease patterns in MATLAB or Python can export CSV trivially, and the data is simple
-enough that a standard origami format (e.g., `.fold`) adds no value.
+**Why:** The prototype used 6–8 separate CSV files per region (nodes, edges,
+angles, edge loop, vent loop, etc.) because the schema grew organically over a
+year of research. Consolidating to one row-per-segment file with a consistent
+column schema reduces the reader to a single function and makes the required
+data immediately obvious to a new user. `type` was kept (rather than inferring
+boundary vs. crease from `angle = 0`) because a flat fold with `angle = 0` is
+physically different from a boundary edge — using 0 as a sentinel would be
+ambiguous. CSV was chosen over JSON/YAML/FOLD format because researchers
+generating crease patterns in MATLAB or Python can export CSV trivially, and
+the data is simple enough that a standard origami format adds no value.
 
-**Angle convention:** Positive angle = mountain fold, negative = valley fold.
-Angles are in radians. A fold with `angle = 0` gets the default `target_angle`
-from the driver script config.
+**Angle convention:** Positive = mountain fold, negative = valley fold, in radians.
+
+---
+
+## Mesh format: no required block names
+
+**Decision:** `load_mesh` only requires `NODES` and `TOPOLOGY` sections.
+No specific block names or mesh structure is assumed. The origami surface
+(membrane elements) is auto-detected from element connectivity: 3- and 4-node
+elements are membranes; 2-node elements are cables. The user can override this
+with explicit node IDs or an attribute ID filter.
+
+**Why:** The prototype hard-coded DGB-specific block names (`Disk_Gores`,
+`Band_Gores`, etc.) throughout the parsing and constraint code. This made it
+impossible to use the tool with any other mesh without renaming blocks. The
+generalization allows any AERO-S mesh to be used directly. The element-connectivity
+heuristic for membrane vs. cable detection works for all standard AERO-S membrane
+models and requires no user input for typical cases.
 
 ---
 

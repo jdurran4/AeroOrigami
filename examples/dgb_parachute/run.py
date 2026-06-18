@@ -20,8 +20,11 @@ mesh_file       = "data/mesh_ORTHO_mem.fem"   # High-fidelity AEROS mesh
 parachute_file  = "data/parachute.include"    # AEROS parachute settings include
 control_template = "data/control_template.C"  # AEROS control file template
 
-disk_crease_file = "data/disk_creases.csv"    # Mountain/valley folds on the disk
-band_crease_file = "data/band_creases.csv"    # Mountain/valley folds on the band
+# Crease pattern CSVs — any number of files, all merged into one pattern.
+# Format per row: x1, y1, z1, x2, y2, z2, angle, type
+#   angle > 0 → mountain; angle < 0 → valley; type = C (crease) or B (boundary)
+disk_crease_file = "data/disk_creases.csv"
+band_crease_file = "data/band_creases.csv"
 
 # --- Remeshing ---
 mesh_size = 0.22          # Target element size for Gmsh remesh (meters)
@@ -43,13 +46,16 @@ output_dir = "results/"   # All AEROS include files written here
 # PIPELINE
 # =============================================================================
 
-# Step 1 — Load and process the original high-fidelity mesh
+# Step 1 — Load and process the original high-fidelity mesh.
+# Requires only NODES and TOPOLOGY sections. ATTRIBUTES are optional.
 mesh = pyaeroori.load_mesh(mesh_file)
 
-# Step 2 — Load the crease pattern (mountain/valley fold line segments + angles)
+# Step 2 — Load the crease pattern from one or more CSV files.
 creases = pyaeroori.load_creases(disk_crease_file, band_crease_file)
 
-# Step 3 — Remesh using Gmsh, aligned to the crease pattern
+# Step 3 — Remesh using Gmsh, aligned to the crease pattern.
+# By default, the origami surface is auto-detected as all 3/4-node (membrane)
+# elements. Override with surface_nodes=[...] or surface_attribute=1 if needed.
 surrogate = pyaeroori.remesh(mesh, creases, mesh_size=mesh_size)
 
 # Step 4 — Build the origami surrogate: detect panels, duplicate crease nodes,
