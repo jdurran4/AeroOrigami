@@ -1,7 +1,7 @@
 from .mesh import load_mesh
+from .crease import load_creases
 
 # Remaining modules implemented incrementally:
-# from .crease import load_creases
 # from .remesh import remesh
 # from .surrogate import build_surrogate
 # from .constraints import add_constraints
