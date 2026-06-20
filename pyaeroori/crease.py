@@ -4,13 +4,16 @@ crease.py — Step 2 of the AeroOrigami pipeline.
 Loads one or more crease pattern CSV files and returns a CreasePattern.
 
 CSV format (one row per line segment):
-    x1, y1, z1, x2, y2, z2, angle, type
+    x1, y1, z1, x2, y2, z2, angle, type[, start_time[, end_time]]
 
-    angle  — target fold angle in radians
-              positive → mountain fold
-              negative → valley fold
-              ignored  → if type is 'B'
-    type   — 'C' (crease fold) or 'B' (boundary edge)
+    angle      — target fold angle in radians
+                 positive → mountain fold
+                 negative → valley fold
+                 ignored  → if type is 'B'
+    type       — 'C' (crease fold) or 'B' (boundary edge)
+    start_time — actuator ramp start time (default 0.0)
+    end_time   — actuator ramp end time   (default None → use build_surrogate's
+                 actuator_ramp_time parameter)
 """
 
 from __future__ import annotations
@@ -20,19 +23,26 @@ from pathlib import Path
 # 3D point as a plain tuple
 Point3D = tuple[float, float, float]
 
+# Crease segment: (p1, p2, angle, start_time, end_time)
+# start_time and end_time are None when not specified in the CSV.
+CreaseSeg = tuple[Point3D, Point3D, float, float | None, float | None]
+
 
 @dataclass
 class CreasePattern:
     """
     Fold line segments and boundary edges loaded from crease CSV files.
 
-    mountain : list of (p1, p2, angle) for mountain folds  (angle > 0)
-    valley   : list of (p1, p2, angle) for valley folds    (angle < 0)
-    boundary : list of (p1, p2) for boundary edges          (no folding)
+    mountain : list of (p1, p2, angle, start_time, end_time) for mountain folds
+    valley   : list of (p1, p2, angle, start_time, end_time) for valley folds
+    boundary : list of (p1, p2) for boundary edges (no folding)
+
+    start_time / end_time are None when not specified in the CSV; build_surrogate
+    fills in the global actuator_ramp_time default.
     """
-    mountain: list[tuple[Point3D, Point3D, float]] = field(default_factory=list)
-    valley:   list[tuple[Point3D, Point3D, float]] = field(default_factory=list)
-    boundary: list[tuple[Point3D, Point3D]]        = field(default_factory=list)
+    mountain: list[CreaseSeg]          = field(default_factory=list)
+    valley:   list[CreaseSeg]          = field(default_factory=list)
+    boundary: list[tuple[Point3D, Point3D]] = field(default_factory=list)
 
     @property
     def all_folds(self) -> list[tuple[Point3D, Point3D, float]]:
@@ -115,6 +125,8 @@ def _parse_csv(
                 p2 = (float(row[3]), float(row[4]), float(row[5]))
                 angle = float(row[6])
                 kind  = row[7].strip().upper()
+                start_t = float(row[8])  if len(row) > 8 else None
+                end_t   = float(row[9])  if len(row) > 9 else None
             except ValueError as e:
                 raise ValueError(f"{filepath}:{i+1} — could not parse row: {e}") from e
 
@@ -122,9 +134,9 @@ def _parse_csv(
                 boundary.append((p1, p2))
             elif kind == "C":
                 if angle >= 0:
-                    mountain.append((p1, p2, angle))
+                    mountain.append((p1, p2, angle, start_t, end_t))
                 else:
-                    valley.append((p1, p2, angle))
+                    valley.append((p1, p2, angle, start_t, end_t))
             else:
                 raise ValueError(
                     f"{filepath}:{i+1} — unknown type '{kind}', expected 'C' or 'B'"
@@ -145,10 +157,10 @@ if __name__ == "__main__":
     cp = load_creases(*sys.argv[1:])
     print(cp)
     if cp.mountain:
-        p1, p2, a = cp.mountain[0]
+        p1, p2, a, *_ = cp.mountain[0]
         print(f"  First mountain: {p1} → {p2}  angle={a:.4f} rad")
     if cp.valley:
-        p1, p2, a = cp.valley[0]
+        p1, p2, a, *_ = cp.valley[0]
         print(f"  First valley  : {p1} → {p2}  angle={a:.4f} rad")
     if cp.boundary:
         p1, p2 = cp.boundary[0]
