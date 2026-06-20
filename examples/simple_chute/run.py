@@ -1,13 +1,10 @@
 """
-DGB Parachute — AeroOrigami pipeline driver
-============================================
-Demonstrates Steps 1–3 for the DGB parachute with Miura-Ori creases.
+Simple Chute — AeroOrigami pipeline driver
+==========================================
+Demonstrates Steps 1–3 for the flat rectangular membrane example.
 Run from the AeroOrigami root directory:
 
-    python examples/dgb_parachute/run.py
-
-Before the first run, generate the crease CSV files from Alexandra's data:
-    python examples/dgb_parachute/convert_alexandra_creases.py
+    python examples/simple_chute/run.py
 """
 
 import sys
@@ -34,15 +31,13 @@ HERE = Path(__file__).parent
 # CONFIGURATION
 # =============================================================================
 
-mesh_file        = HERE / "dgb_mesh.fem"
-disk_crease_file = HERE / "dgb_disk_creases.csv"
-band_crease_file = HERE / "dgb_band_creases.csv"
+mesh_file   = HERE / "simple_chute_mesh.fem"
+crease_file = HERE / "simple_chute_creases.csv"
 
-mesh_size          = 0.22    # Target element size for Gmsh remesh (Path A, metres)
+mesh_size          = 0.5     # Target element size for Gmsh remesh (Path A, metres)
 penalty_stiffness  = 8e9
 actuator_ramp_time = 3.0
 min_radius         = 0.05
-include_cables     = True
 output_dir         = HERE / "results"
 
 # =============================================================================
@@ -56,45 +51,38 @@ print("STEP 1 — Mesh")
 print("=" * 50)
 mesh_stats(mesh)
 
-plot_mesh(mesh, title="DGB Parachute — Mesh (Step 1)")
+plot_mesh(mesh, title="Simple Chute — Mesh (Step 1)")
 
 # =============================================================================
 # STEP 2 — Load the crease pattern
 # =============================================================================
 
-# To convert Alexandra's original CSVs first:
-#   python examples/dgb_parachute/convert_alexandra_creases.py
-
-disk_creases = load_creases(disk_crease_file)
-band_creases = load_creases(band_crease_file)
-all_creases  = load_creases(disk_crease_file, band_crease_file)
+creases = load_creases(crease_file)
 
 print()
 print("=" * 50)
 print("STEP 2 — Crease Pattern")
 print("=" * 50)
-print("Disk:")
-crease_stats(disk_creases)
-print("Band:")
-crease_stats(band_creases)
+crease_stats(creases)
 print()
-check_crease_coverage(mesh, all_creases, tol=0.1)
+check_crease_coverage(mesh, creases, tol=0.3)
 
-plot_creases(all_creases, title="DGB Parachute — Crease Pattern (Step 2)")
-plot_creases_on_mesh(mesh, all_creases,
-                     title="DGB Parachute — Crease on Mesh (Step 2 alignment)")
+plot_creases(creases, title="Simple Chute — Crease Pattern (Step 2)")
+plot_creases_on_mesh(mesh, creases,
+                     title="Simple Chute — Crease on Mesh (Step 2 alignment)")
 
 # =============================================================================
 # STEP 3 — Remesh
 # =============================================================================
 #
 # PATH B (crease-as-mesh) — default for structured patterns.
-# Disk and band share a snap map so their common rim nodes stitch.
-# Every crease vertex is a mesh node — full actuation coverage guaranteed.
+# Every crease-segment endpoint is a mesh node, so every crease fold is
+# guaranteed a driver-joint site in Step 4.  No Gmsh required.
 # Viewer: matplotlib plot_mesh window.
 #
 # PATH A (Gmsh remesh) — uncomment the block below to use instead.
-# Processes disk (planar) and band (cylindrical) in one Gmsh session.
+# Gmsh adds interior nodes along long crease segments; useful when you need
+# fine sub-panel resolution or the surface is curved / non-structured.
 # Run check_mesh_crease_resolution() after to verify actuation coverage.
 # Viewer: Gmsh GUI.
 # =============================================================================
@@ -105,25 +93,23 @@ print("STEP 3 — Remesh  [Path B: crease-as-mesh]")
 print("=" * 50)
 
 output_dir.mkdir(exist_ok=True)
-disk_region = Region(disk_creases, name="disk", use_crease_mesh=True)
-band_region = Region(band_creases, name="band", use_crease_mesh=True)
-coarse      = remesh(mesh, disk_region, band_region, show=True)
+region = Region(creases, name="simple_chute", use_crease_mesh=True)
+coarse = remesh(mesh, region, show=True)
 
 print(f"  Coarse mesh : {len(coarse.nodes)} nodes, "
       f"{len(coarse.elements)} elements, "
       f"{len(set(coarse.panel_map.values()))} panels")
 
 # ── Path A alternative ───────────────────────────────────────────────────────
-# disk_region_a = Region(disk_creases, mesh_size=mesh_size, name="disk")
-# band_region_a = Region(band_creases, mesh_size=mesh_size, name="band")
-# coarse        = remesh(mesh, disk_region_a, band_region_a,
-#                        out_file=str(output_dir / "origami.msh"),
-#                        show=True)
+# region_a = Region(creases, mesh_size=mesh_size, name="simple_chute")
+# coarse   = remesh(mesh, region_a,
+#                   out_file=str(output_dir / "origami.msh"),
+#                   show=True)
 # print(f"  Coarse mesh : {len(coarse.nodes)} nodes, "
 #       f"{len(coarse.elements)} elements, "
 #       f"{len(set(coarse.panel_map.values()))} panels")
 # print()
-# check_mesh_crease_resolution(coarse, all_creases)
+# check_mesh_crease_resolution(coarse, creases)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # =============================================================================
@@ -137,7 +123,7 @@ print("=" * 50)
 
 surrogate = build_surrogate(
     coarse,
-    all_creases,
+    creases,
     penalty_stiffness=penalty_stiffness,
     actuator_ramp_time=actuator_ramp_time,
     # vertex_joint_type=120,  # force spherical at all crease endpoints (research)
@@ -147,39 +133,38 @@ surrogate = build_surrogate(
 print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
 print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
 
-plot_surrogate_axes(surrogate, title="DGB Parachute — Hinge Axes (Step 4)",arrow_length=0.1)
+plot_surrogate_axes(surrogate, title="Simple Chute — Hinge Axes (Step 4)", arrow_length=0.5)
 
 # =============================================================================
 # STEP 5 — Add physics (BCs, loads, cables)
 # =============================================================================
-
-# NodeQuery resolves at runtime and prints matched nodes — no separate
-# node-ID lookup run needed.
-
-# For DGB cables: either name the blocks explicitly, or use all_bars=True
-# to automatically pick up every 2-node element in the original mesh.
-
-config = add_physics(
-    surrogate,
-    mesh=mesh,                          # required for block= and all_bars= lookups
-    disp=[
-        # Vent ring: pin xyz translation to keep apex in place
-        (N.along_line((0,0,47.5), (0,0,47.5), tol=0.02), [1, 2, 3]),
-    ],
-    lmpc=[
-        {"type": "min_z",      "z_min":  40.0},
-        {"type": "min_radius", "r_min":   0.1},
-    ],
-    cables=[
-        # Use named blocks (recommended for DGB — avoids beam elements
-        # embedded in the canopy surface).  Each chain of bar elements
-        # in the block becomes a single type-203 tension-only spring.
-        {"blocks": ["Suspension_Lines", "Vent_Lines", "Gap_Lines", "Riser_Line", "TripleBridle_Lines"], "tol": 0.05},
-        # Alternative — one block at a time:
-        # {"block": "Suspension_Lines"},
-    ],
-)
-plot_physics(surrogate, config, title="DGB Parachute — Physics Overview (Step 5)", arrow_length=0.1)
+#
+# NodeQuery resolves at runtime and prints matched nodes so you don't need
+# a separate plotting run to identify node IDs.
+#
+# Simple chute has no cable elements in the mesh (all 2-node elements would
+# be empty), but you can add explicit cable chains with {"points": [...]}.
+#
+# Uncomment and adjust coordinates to match your mesh:
+#
+# config = add_physics(
+#     surrogate,
+#     mesh=mesh,                        # required for all_bars cable detection
+#     disp=[
+#         # Pin top-edge nodes (z≈16, x=±0.8) — fix xyz translation
+#         (N.along_line((-0.8, 0, 16), (0.8, 0, 16), tol=0.05), [1, 2, 3]),
+#     ],
+#     lmpc=[
+#         {"type": "min_z", "z_min": -1.0},
+#     ],
+#     cables=[
+#         # The mesh has 4 suspension lines (type-6 beams) in the TOPOLOGY section
+#         # (no named blocks). all_bars detects them automatically and converts
+#         # each 5-element chain into a single type-203 tension-only spring.
+#         {"all_bars": True, "tol": 0.05},
+#     ],
+# )
+# plot_physics(surrogate, config, title="Simple Chute — Physics Overview (Step 5)")
 
 # =============================================================================
 # STEP 6 — Write AEROS files

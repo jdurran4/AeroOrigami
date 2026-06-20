@@ -7,22 +7,27 @@ EFRAMES, block headers, comment lines) is silently ignored.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 @dataclass
 class Mesh:
     """
-    Parsed AERO-S mesh.
+    AERO-S mesh — used both for the original hi-fi mesh (Step 1) and the
+    coarse origami surrogate mesh produced by remesh() (Step 3).
 
-    nodes    : node_id → (x, y, z)
-    elements : elem_id → (etype, [node_ids])
-               elem_ids are globally unique integers assigned during parsing,
-               independent of whatever IDs appear in the source file.
+    nodes     : node_id → (x, y, z)
+    elements  : elem_id → (etype, [node_ids])
+                elem_ids are globally unique integers, starting at 1.
+    panel_map : elem_id → panel_id (populated by remesh(); empty otherwise)
     """
-    nodes:    dict[int, tuple[float, float, float]]
-    elements: dict[int, tuple[int, list[int]]]
+    nodes:      dict[int, tuple[float, float, float]]
+    elements:   dict[int, tuple[int, list[int]]]
+    panel_map:  dict[int, int]  = field(default_factory=dict)
+    path:       str             = field(default="")   # "A" (Gmsh) or "B" (crease-as-mesh)
+    blocks:     dict[str, list[int]] = field(default_factory=dict)  # block name → [seq_eid]
+    attributes: dict[int, int]  = field(default_factory=dict)       # seq_eid → attr_id
 
     # ------------------------------------------------------------------
     # Derived views (computed on access, not stored)
@@ -109,10 +114,14 @@ def load_mesh(filepath: str | Path) -> Mesh:
     """
     filepath = Path(filepath)
 
-    nodes: dict[int, tuple[float, float, float]] = {}
-    elements: dict[int, tuple[int, list[int]]] = {}
-    next_eid = 1
-    section = None  # 'nodes' | 'topology' | None
+    nodes:      dict[int, tuple[float, float, float]] = {}
+    elements:   dict[int, tuple[int, list[int]]] = {}
+    attributes: dict[int, int] = {}
+    blocks:     dict[str, list[int]] = {}
+    next_eid    = 1
+    section     = None          # 'nodes' | 'topology' | 'attributes' | None
+    orig_to_seq: dict[int, int] = {}   # block-local eid → sequential eid
+    current_block: str | None  = None  # active block name (from *  name: ...)
 
     with open(filepath) as f:
         for raw_line in f:
@@ -127,9 +136,17 @@ def load_mesh(filepath: str | Path) -> Mesh:
                 continue
             if line == "TOPOLOGY":
                 section = "topology"
+                orig_to_seq = {}        # reset mapping; each block restarts at eid=1
                 continue
-            # These keywords end the current section; their content is ignored
-            if line in ("ATTRIBUTES", "EFRAMES") or line.startswith("*"):
+            if line == "ATTRIBUTES":
+                section = "attributes"
+                continue
+            if line == "EFRAMES" or line.startswith("*"):
+                # Detect block name header before resetting section
+                if line.startswith("*") and "name:" in line:
+                    current_block = line.split("name:")[-1].strip()
+                    if current_block not in blocks:
+                        blocks[current_block] = []
                 section = None
                 continue
 
@@ -142,17 +159,30 @@ def load_mesh(filepath: str | Path) -> Mesh:
 
             elif section == "topology":
                 if len(parts) >= 3:
-                    etype = int(parts[1])
-                    node_ids = [int(p) for p in parts[2:]]
+                    orig_eid  = int(parts[0])
+                    etype     = int(parts[1])
+                    node_ids  = [int(p) for p in parts[2:]]
                     elements[next_eid] = (etype, node_ids)
+                    orig_to_seq[orig_eid] = next_eid
+                    if current_block is not None:
+                        blocks[current_block].append(next_eid)
                     next_eid += 1
+
+            elif section == "attributes":
+                if len(parts) >= 2:
+                    orig_eid = int(parts[0])
+                    attr_id  = int(parts[1])
+                    seq_eid  = orig_to_seq.get(orig_eid)
+                    if seq_eid is not None:
+                        attributes[seq_eid] = attr_id
 
     if not nodes:
         raise ValueError(f"No NODES section found in {filepath}")
     if not elements:
         raise ValueError(f"No TOPOLOGY section found in {filepath}")
 
-    return Mesh(nodes=nodes, elements=elements)
+    return Mesh(nodes=nodes, elements=elements,
+                blocks=blocks, attributes=attributes)
 
 
 if __name__ == "__main__":
