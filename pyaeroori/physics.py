@@ -5,8 +5,8 @@ add_physics(surrogate, ...) adds Dirichlet BCs, LMPC inequality constraints,
 point forces, and cable elements to the surrogate model.
 
 Returns a ModelConfig passed to write_aeros(..., config=config) to emit
-DISP.include, LMPC.include, FORCE.include, and cable elements in
-mesh_modified.include.
+DISP.include, LMPC.include, USDF.include + control.C, and cable elements
+in ORIGAMI_MESH.include.
 """
 
 from __future__ import annotations
