@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from pyaeroori import load_mesh, load_creases, Region, remesh, build_surrogate, write_aeros, add_physics, N
+from pyaeroori import load_mesh, load_creases, Region, remesh, build_surrogate, write_aeros, SimConfig, add_physics, N
 from pyaeroori.plot import (
     mesh_stats,
     crease_stats,
@@ -175,11 +175,21 @@ print("=" * 50)
 print("STEP 6 — Write AEROS files")
 print("=" * 50)
 
-# Without physics config (fold geometry only):
+# Without simulation config (fold geometry only):
 write_aeros(surrogate, output_dir=output_dir)
 
-# With physics config (uncomment after configuring Step 5 above):
-# write_aeros(surrogate, output_dir=output_dir, config=config)
+# With physics + simulation config (uncomment and adjust after Step 5 above):
+# sim = SimConfig(
+#     project_name    = "Simple_Chute",
+#     sim_name        = "simple_chute_fold",
+#     end_time        = 1.0,
+#     shell_E         = 1e7,
+#     shell_nu        = 0.4,
+#     shell_rho       = 40000.0,
+#     shell_t         = 1.0,
+#     cable_stiffness = 10000.0,
+# )
+# write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
 
 print(f"Done. Files written to {output_dir}")
 
@@ -188,7 +198,7 @@ print(f"Done. Files written to {output_dir}")
 # =============================================================================
 
 # disp_file  = HERE / "foldfiles/gdisplac6.xpost.5"
-# fold_mesh  = output_dir / "mesh_modified.include"
+# fold_mesh  = output_dir / "ORIGAMI_MESH.include"
 # idisp_file = HERE / "foldfiles/IDISP6.include"
 # mapped = pyaeroori.map_displacements(mesh, fold_mesh, disp_file, rbf_neighbors=100)
 # pyaeroori.write_idisp6(mapped, idisp_file)

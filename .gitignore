@@ -19,5 +19,8 @@ build/
 # VTK / ParaView output
 *.vtk
 
+# Generated example outputs (run the example scripts to regenerate)
+examples/*/results/
+
 # Data files (add paths to large mesh files here)
 # data/*.fem
