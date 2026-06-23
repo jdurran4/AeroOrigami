@@ -270,7 +270,10 @@ def add_physics(
     if cables:
         print("\n  -- CABLES --")
     next_nid = max(surrogate.nodes) + 1
-    next_eid = max(surrogate.elements) + 1
+    # Start after both shell EIDs and joint EIDs — joint EIDs occupy the range
+    # [max(shells)+1, max(shells)+len(joints)], so cables must start after that.
+    _max_joint_eid = max((j.eid for j in surrogate.joints), default=0)
+    next_eid = max(max(surrogate.elements), _max_joint_eid) + 1
 
     for spec in cables:
         tol = float(spec.get("tol", 1e-3))

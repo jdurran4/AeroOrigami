@@ -40,7 +40,9 @@ if TYPE_CHECKING:
 _SHELL_ATTR     = 1    # all shell elements (types 15 / 1515)
 _SPH_ATTR       = 2    # all spherical joints (type 120)
 _REV_ATTR_START = 3    # revolute joints start here, one per joint (type 126)
-_CABLE_ATTR     = 10   # cable tension-only springs (type 203)
+_CABLE_ATTR     = 10000  # cable tension-only springs (type 203)
+# NOTE: _REV_ATTR_START + len(revolute_joints) can reach thousands, so cable
+# attr must be a large fixed value that won't collide with revolute joint attrs.
 
 
 @dataclass
