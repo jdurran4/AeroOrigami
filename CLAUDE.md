@@ -43,7 +43,7 @@ Core dependencies: `numpy scipy matplotlib gmsh meshio`.
 | 3 | `remesh` | `remesh.py` | `CoarseMesh` |
 | 4 | `build_surrogate` | `surrogate.py` | `Surrogate` |
 | 5 | `add_physics` | `physics.py` | `ModelConfig` |
-| 6 | `write_aeros` | `writer.py` | AERO-S files on disk |
+| 6 | `write_aeros` | `writer.py` | AERO-S files + cluster scripts on disk |
 | 7 | `map_displacements` / `write_idisp6` | `mapping.py` | **Not yet implemented** |
 
 All public exports are in `pyaeroori/__init__.py`.
@@ -65,7 +65,12 @@ All public exports are in `pyaeroori/__init__.py`.
   and junction nodes.
 
 - **`physics.py`**: `add_physics(surrogate, mesh, disp, lmpc, forces, cables)`.
-  NodeQuery (alias `N`) resolves at runtime and prints matched nodes. Cable chains
+  Processing order: cables first, then DISP/LMPC/forces — so cable endpoint nodes
+  exist when NodeQuery resolves BCs. NodeQuery (alias `N`) resolves against
+  `surrogate.nodes + config.cable_nodes` and prints matched nodes at runtime.
+  Selectors: `N.near`, `N.along_line`, `N.above(z=...)`, `N.all`, `N.ids`.
+  LMPC specs accept an optional `"nodes"` key (NodeQuery) to restrict which nodes
+  receive the constraint; omitting it applies to all membrane nodes. Cable chains
   detected via `_build_cable_chains` — collapses each connected chain of 2-node
   elements to a single type-203 tension-only spring between endpoints.
 
@@ -73,8 +78,10 @@ All public exports are in `pyaeroori/__init__.py`.
   Always writes `ORIGAMI_MESH.include`, `ACTUATORS.include`, `EFRAMES.include`.
   When `config` provided: adds `DISP.include`, `LMPC.include`, and if `force_bcs`
   are present, `USDF.include` + `control.C`. When `sim=SimConfig(...)` provided:
-  adds `MATERIAL.include` and `fold.fem` (main AERO-S input file, conditional
-  INCLUDE lines omitted when unused).
+  adds `MATERIAL.include`, `fold.fem` (main AERO-S input file, conditional
+  INCLUDE lines omitted when unused), and cluster scripts `run.sh`, `run.sbatch`,
+  `postpro.sh`, `clean.sh`. Update path variables in `run.sh`/`postpro.sh` once
+  for your cluster.
 
 - **`plot.py`**: Visualization helpers — `plot_mesh`, `plot_creases`,
   `plot_surrogate_axes`, `plot_physics`, `mesh_stats`, `crease_stats`,
