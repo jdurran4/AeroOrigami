@@ -24,11 +24,11 @@ Original mesh (.fem) + crease CSVs
 [3] remesh             → CoarseMesh  (Gmsh Path A or crease-as-mesh Path B)
 [4] build_surrogate    → Surrogate   (node duplication + driver joints + EFRAMES)
 [5] add_physics        → ModelConfig (BCs, LMPC constraints, cable springs)
-[6] write_aeros        → AERO-S include files on disk
+[6] write_aeros        → AERO-S include files + cluster scripts on disk
           │
-          │   (user runs AERO-S folding simulation externally)
+          │   (user syncs sim_files/ to cluster, runs AERO-S)
           │
-[7] map_displacements  → fine-mesh displacement field  (TODO — not yet implemented)
+[7] map_displacements  → fine-mesh displacement field  (not yet implemented)
     write_idisp6       → IDISP6.include
 ```
 
@@ -45,7 +45,6 @@ Original mesh (.fem) + crease CSVs
 | `physics.py` | 5 | `add_physics(surrogate, ...) → ModelConfig`, `N` / `NodeQuery` |
 | `writer.py` | 6 | `write_aeros(surrogate, output_dir, config, sim) → dict[str, Path]`, `SimConfig` |
 | `plot.py` | — | `plot_mesh`, `plot_surrogate_axes`, `plot_physics`, `mesh_stats`, … |
-| `mapping.py` | 7 | `map_displacements`, `write_idisp6` — not yet implemented |
 
 ---
 
@@ -57,16 +56,19 @@ The original high-fidelity mesh. Read-only after Step 1.
 ```python
 @dataclass
 class Mesh:
-    nodes:         dict[int, tuple[float, float, float]]  # nid → (x, y, z)
-    elements:      dict[int, tuple[int, list[int]]]        # eid → (etype, [nids])
-    attributes:    dict[int, int]                           # eid → attr_id
-    blocks:        dict[str, list[int]]                     # block name → [eids]
-    cable_elements: dict[int, tuple[int, list[int]]]       # 2-node elements only
+    nodes:      dict[int, tuple[float, float, float]]  # nid → (x, y, z)
+    elements:   dict[int, tuple[int, list[int]]]        # eid → (etype, [nids])
+    attributes: dict[int, int]                          # eid → attr_id
+    blocks:     dict[str, list[int]]                    # block name → [eids]
+
+    # Derived properties (not stored fields):
+    # membrane_elements, cable_elements, membrane_nodes, cable_nodes
 ```
 
 AERO-S element types stored in `etype`: 2-node (cable/bar), 3-node (triangular
 shell), 4-node (quad shell), etc. Block names come from `*  name: BlockName`
-headers in the FEM file.
+headers in the FEM file. 2-node elements are `cable_elements`; 3+ node elements
+are `membrane_elements`.
 
 ### `CreasePattern`
 Fold-line segments loaded from one or more CSVs.
@@ -82,16 +84,8 @@ Each `CreaseSegment` carries `(p1, p2, angle, fold_type)` where `fold_type` is
 `"mountain"` (angle > 0) or `"valley"` (angle < 0).
 
 ### `CoarseMesh`
-The crease-aligned remeshed surface, output of Step 3.
-
-```python
-@dataclass
-class CoarseMesh:
-    nodes:      dict[int, tuple[float, float, float]]
-    elements:   dict[int, tuple[int, list[int]]]
-    panel_map:  dict[int, int]    # eid → panel_id
-    crease_edges: set[tuple[int, int]]
-```
+The crease-aligned remeshed surface, output of Step 3. Same `Mesh` dataclass,
+with `panel_map` populated (eid → panel_id).
 
 ### `Surrogate`
 The origami surrogate, output of Step 4. Contains the duplicated crease nodes
@@ -100,11 +94,11 @@ and all joint elements.
 ```python
 @dataclass
 class Surrogate:
-    nodes:            dict[int, tuple[float, float, float]]
-    elements:         dict[int, tuple[int, list[int]]]
-    revolute_joints:  list[JointInfo]
-    spherical_joints: list[JointInfo]
-    panel_map:        dict[int, int]
+    nodes:             dict[int, tuple[float, float, float]]
+    elements:          dict[int, tuple[int, list[int]]]
+    revolute_joints:   list[JointInfo]
+    spherical_joints:  list[JointInfo]
+    panel_map:         dict[int, int]
     penalty_stiffness: float
 
 @dataclass
@@ -142,8 +136,8 @@ class SimConfig:
     time_step:       float = 5e-5
     end_time:        float = 1.0
     rho:             float = 0.7      # Newmark numerical dissipation
-    alpha_damp:      float = 1e-7     # Rayleigh mass coefficient
-    beta_damp:       float = 2.0      # Rayleigh stiffness coefficient
+    a_damp:          float = 1e-7     # Rayleigh damping coefficient (RAYDAMP param 1)
+    b_damp:          float = 2.0      # Rayleigh damping coefficient (RAYDAMP param 2)
     solver:          str   = "sparse"
     lmpc_penalty:    float = 1e8
     output_freq:     int   = 100
@@ -224,7 +218,7 @@ Gmsh generates a new mesh at a target element size, with crease lines embedded a
 geometric constraints. Produces more uniform element sizes. Requires Gmsh.
 Output saved as `.msh` (gitignored).
 
-Both paths produce a `CoarseMesh` with the same interface.
+Both paths produce a `Mesh` with `panel_map` populated.
 
 ---
 
@@ -236,12 +230,43 @@ requiring a pre-run to find IDs. Queries resolve at runtime and print matches:
 ```python
 N.near(x, y, z, tol=0.05)              # sphere around a point
 N.along_line(p1, p2, tol=0.05)         # within distance of a segment
+N.above(z=46.8)                         # z >= threshold (x=, y= also supported)
 N.all()                                 # every node
 N.ids([1, 2, 3])                        # explicit IDs
 ```
 
 All co-located copies of a selected node (created by node duplication in Step 4)
 are automatically included in DISP BCs.
+
+NodeQuery resolves against the combined surrogate + cable endpoint node set, so
+queries like `N.near(...)` can target cable attachment points even though those
+nodes are added during cable processing.
+
+---
+
+## Step 5: Processing order in `add_physics`
+
+Cables are processed **before** DISP/LMPC/force BCs. This ensures that cable
+endpoint nodes (added to `config.cable_nodes` during chain detection) are available
+when NodeQuery resolves DISP and force BCs. All three BC types resolve against
+`{**surrogate.nodes, **config.cable_nodes}`.
+
+---
+
+## Step 5: LMPC constraints
+
+```python
+lmpc=[
+    # Apply min_z only to disk nodes (z >= 46.8), not the full canopy:
+    {"type": "min_z",      "z_min": 46.8, "nodes": N.above(z=46.8)},
+    # Apply min_radius to all membrane nodes (no "nodes" key = default):
+    {"type": "min_radius", "r_min": 0.1},
+]
+```
+
+The optional `"nodes"` key accepts any `NodeQuery` (or explicit ID list) to
+restrict which nodes receive the constraint. Without it, the constraint applies
+to all membrane nodes in the surrogate.
 
 ---
 
@@ -275,3 +300,33 @@ Attribute IDs are globally unique so there is no conflict.
 The `fold.fem` main input file is written with conditional INCLUDE lines:
 `LMPC.include`, `USDF.include`, `LOAD ./control.so`, and `DISP.include` are
 omitted when the corresponding sections are empty.
+
+When `sim=` is provided, four cluster scripts are also written into `output_dir/`:
+
+| Script | Purpose |
+|---|---|
+| `run.sh` | Compile `control.so` (if `control.C` present) and launch AERO-S |
+| `run.sbatch` | SLURM wrapper for `run.sh`; job name set to `sim.sim_name` |
+| `postpro.sh` | Generate `.top` topology file and convert to Exodus for ParaView |
+| `clean.sh` | Wipe xpost/restart/postpro output while keeping directory structure |
+
+Path variables (`AEROS`, `AEROSDIR`, etc.) at the top of `run.sh` and `postpro.sh`
+must be updated to match the target cluster before submitting.
+
+---
+
+## sim_files directory layout
+
+Each example writes output to `examples/<example>/sim_files/`. AERO-S expects
+three subdirectories to exist before it runs:
+
+```
+sim_files/
+├── fold.fem, *.include, run.sh, run.sbatch, postpro.sh, clean.sh
+├── postpro/      ← xp2exo Exodus output (tracked via .gitkeep)
+├── references/   ← AERO-S restart files  (tracked via .gitkeep)
+└── results/      ← AERO-S xpost output   (tracked via .gitkeep)
+```
+
+`run.sh` creates these subdirectories with `mkdir -p` before launching AERO-S,
+so they will exist even if `.gitkeep` files were not synced.
