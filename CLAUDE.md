@@ -96,7 +96,7 @@ Attribute IDs are fixed constants in `writer.py`:
 - 1 → shell material (in `MATERIAL.include`)
 - 2 → spherical joint CONMAT (in `ORIGAMI_MESH.include`)
 - 3+ → revolute joint CONMAT RAMP, one per joint (in `ACTUATORS.include`)
-- 10 → cable SPRINGMAT (in `MATERIAL.include`)
+- 10000 → cable SPRINGMAT (in `MATERIAL.include`) — large fixed value to avoid colliding with revolute joint attrs, which can number in the thousands
 
 Multiple MATERIAL sections in different INCLUDE files are merged by AERO-S at load
 time — IDs must be globally unique, which they are.

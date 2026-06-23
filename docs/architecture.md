@@ -295,7 +295,7 @@ Attribute IDs are globally unique so there is no conflict.
 |---|---|
 | `ORIGAMI_MESH.include` | Attr 2: spherical joint CONMAT |
 | `ACTUATORS.include` | Attrs 3+: revolute joint CONMAT RAMP (one per joint) |
-| `MATERIAL.include` | Attr 1: shell material, Attr 10: cable SPRINGMAT |
+| `MATERIAL.include` | Attr 1: shell material, Attr 10000: cable SPRINGMAT |
 
 The `fold.fem` main input file is written with conditional INCLUDE lines:
 `LMPC.include`, `USDF.include`, `LOAD ./control.so`, and `DISP.include` are
