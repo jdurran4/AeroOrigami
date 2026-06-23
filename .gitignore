@@ -20,7 +20,11 @@ build/
 *.vtk
 
 # Generated example outputs (run the example scripts to regenerate)
-examples/*/results/
+examples/*/sim_files/
+# But keep the empty subdirs AERO-S needs
+!examples/*/sim_files/postpro/.gitkeep
+!examples/*/sim_files/references/.gitkeep
+!examples/*/sim_files/results/.gitkeep
 
 # Data files (add paths to large mesh files here)
 # data/*.fem

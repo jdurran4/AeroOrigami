@@ -38,7 +38,7 @@ mesh_size          = 0.5     # Target element size for Gmsh remesh (Path A, metr
 penalty_stiffness  = 8e9
 actuator_ramp_time = 3.0
 min_radius         = 0.05
-output_dir         = HERE / "results"
+output_dir         = HERE / "sim_files"
 
 # =============================================================================
 # STEP 1 — Load the original mesh

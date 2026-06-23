@@ -21,6 +21,16 @@ python examples/dgb_parachute/convert_alexandra_creases.py
 python examples/dgb_parachute/run.py
 ```
 
+Output lands in `examples/<example>/sim_files/`. When `SimConfig` is passed to
+`write_aeros`, cluster scripts (`run.sh`, `run.sbatch`, `postpro.sh`, `clean.sh`)
+are written there automatically alongside the AERO-S include files.
+
+To sync to a cluster:
+```bash
+./sync_to_cluster.sh examples/dgb_parachute dgb_v1
+# Then on the cluster: cd /scratch/.../dgb_v1 && sbatch run.sbatch
+```
+
 No test suite. No build step. `requirements.txt` is a full conda environment dump.
 Core dependencies: `numpy scipy matplotlib gmsh meshio`.
 

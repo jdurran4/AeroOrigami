@@ -66,6 +66,13 @@ class NodeQuery:
         """Select nodes by explicit ID list."""
         return cls("ids", {"nids": list(nids)})
 
+    @classmethod
+    def above(cls, *, x: float | None = None,
+                       y: float | None = None,
+                       z: float | None = None) -> "NodeQuery":
+        """Select nodes where coordinate(s) are >= the given threshold(s)."""
+        return cls("above", {"x": x, "y": y, "z": z})
+
     def resolve(self, nodes: dict[int, tuple], label: str = "") -> list[int]:
         """
         Evaluate this query against `nodes` (node_id → (x,y,z)).
@@ -92,6 +99,19 @@ class NodeQuery:
             for nid, xyz in nodes.items():
                 if np.linalg.norm(np.array(xyz) - ref) <= tol:
                     matched.append(nid)
+
+        elif self._mode == "above":
+            thx = self._params["x"]
+            thy = self._params["y"]
+            thz = self._params["z"]
+            for nid, (nx, ny, nz) in nodes.items():
+                if thx is not None and nx < thx:
+                    continue
+                if thy is not None and ny < thy:
+                    continue
+                if thz is not None and nz < thz:
+                    continue
+                matched.append(nid)
 
         elif self._mode == "along_line":
             p1  = np.array(self._params["p1"], dtype=float)
@@ -246,94 +266,7 @@ def add_physics(
     for nid, xyz in surrogate.nodes.items():
         coord_map[_rp(xyz)].append(nid)
 
-    # ── DISP Dirichlet BCs ────────────────────────────────────────────────────
-    if disp:
-        print("\n  -- DISP --")
-    for entry in disp:
-        query, dofs = entry
-        if isinstance(query, NodeQuery):
-            primary = query.resolve(surrogate.nodes, label="DISP")
-        else:
-            primary = sorted(query)
-
-        # Expand to co-located copies
-        all_nids: set[int] = set()
-        for nid in primary:
-            for co in coord_map[_rp(surrogate.nodes[nid])]:
-                all_nids.add(co)
-
-        for nid in sorted(all_nids):
-            config.disp_bcs.append((nid, list(dofs)))
-
-    # ── LMPC inequality constraints ───────────────────────────────────────────
-    if lmpc:
-        print("\n  -- LMPC --")
-    cid = 1
-    for spec in lmpc:
-        ctype = spec.get("type", "custom")
-
-        if ctype == "min_z":
-            z_min = float(spec["z_min"])
-            mem_nids = _membrane_nids(surrogate)
-            count = 0
-            for nid in sorted(mem_nids):
-                x, y, z0 = surrogate.nodes[nid]
-                rhs = -(z_min - z0)          # = z0 - z_min
-                config.lmpc_rows.append(
-                    LmpcRow(cid=cid, rhs=rhs, terms=[(nid, 3, -1.0)])
-                )
-                cid += 1
-                count += 1
-            print(f"  LMPC min_z={z_min}: {count} constraints added")
-
-        elif ctype == "min_radius":
-            r_min = float(spec["r_min"])
-            mem_nids = _membrane_nids(surrogate)
-            count = 0
-            for nid in sorted(mem_nids):
-                x, y, z = surrogate.nodes[nid]
-                r0 = math.sqrt(x * x + y * y)
-                if r0 < 1e-12:
-                    continue
-                ax = x / r0
-                ay = y / r0
-                rhs = -(r_min - r0)          # = r0 - r_min
-                config.lmpc_rows.append(
-                    LmpcRow(cid=cid, rhs=rhs, terms=[(nid, 1, -ax), (nid, 2, -ay)])
-                )
-                cid += 1
-                count += 1
-            print(f"  LMPC min_radius={r_min}: {count} constraints added")
-
-        elif ctype == "custom":
-            nid   = int(spec["nid"])
-            dof   = int(spec["dof"])
-            coeff = float(spec["coeff"])
-            rhs   = float(spec["rhs"])
-            terms = [(nid, dof, coeff)]
-            if "nid2" in spec:
-                terms.append((int(spec["nid2"]), int(spec["dof2"]),
-                               float(spec["coeff2"])))
-            config.lmpc_rows.append(LmpcRow(cid=cid, rhs=rhs, terms=terms))
-            cid += 1
-
-        else:
-            print(f"  WARNING: unknown LMPC type '{ctype}' — skipped")
-
-    # ── Point forces ──────────────────────────────────────────────────────────
-    if forces:
-        print("\n  -- FORCES --")
-    for entry in forces:
-        query, fvec = entry
-        fx, fy, fz = float(fvec[0]), float(fvec[1]), float(fvec[2])
-        if isinstance(query, NodeQuery):
-            nids = query.resolve(surrogate.nodes, label="FORCE")
-        else:
-            nids = sorted(query)
-        for nid in nids:
-            config.force_bcs.append((nid, fx, fy, fz))
-
-    # ── Cable elements ────────────────────────────────────────────────────────
+    # ── Cable elements (processed first so endpoints exist for DISP resolution) ─
     if cables:
         print("\n  -- CABLES --")
     next_nid = max(surrogate.nodes) + 1
@@ -381,6 +314,99 @@ def add_physics(
         if config.cable_elements:
             next_eid = config.cable_elements[-1][0] + 1
 
+    # Combined node lookup — surrogate nodes + cable endpoint nodes added above
+    all_nodes = {**surrogate.nodes, **config.cable_nodes}
+
+    # ── DISP Dirichlet BCs ────────────────────────────────────────────────────
+    if disp:
+        print("\n  -- DISP --")
+    for entry in disp:
+        query, dofs = entry
+        if isinstance(query, NodeQuery):
+            primary = query.resolve(all_nodes, label="DISP")
+        else:
+            primary = sorted(query)
+
+        # Expand to co-located copies (surrogate nodes only; cable nodes have none)
+        all_nids: set[int] = set()
+        for nid in primary:
+            copies = coord_map.get(_rp(all_nodes[nid]))
+            if copies:
+                all_nids.update(copies)
+            else:
+                all_nids.add(nid)
+
+        for nid in sorted(all_nids):
+            config.disp_bcs.append((nid, list(dofs)))
+
+    # ── LMPC inequality constraints ───────────────────────────────────────────
+    if lmpc:
+        print("\n  -- LMPC --")
+    cid = 1
+    for spec in lmpc:
+        ctype = spec.get("type", "custom")
+
+        if ctype == "min_z":
+            z_min = float(spec["z_min"])
+            target_nids = _resolve_lmpc_nodes(spec, all_nodes, surrogate)
+            count = 0
+            for nid in sorted(target_nids):
+                x, y, z0 = all_nodes[nid]
+                rhs = -(z_min - z0)          # = z0 - z_min
+                config.lmpc_rows.append(
+                    LmpcRow(cid=cid, rhs=rhs, terms=[(nid, 3, -1.0)])
+                )
+                cid += 1
+                count += 1
+            print(f"  LMPC min_z={z_min}: {count} constraints added")
+
+        elif ctype == "min_radius":
+            r_min = float(spec["r_min"])
+            target_nids = _resolve_lmpc_nodes(spec, all_nodes, surrogate)
+            count = 0
+            for nid in sorted(target_nids):
+                x, y, z = all_nodes[nid]
+                r0 = math.sqrt(x * x + y * y)
+                if r0 < 1e-12:
+                    continue
+                ax = x / r0
+                ay = y / r0
+                rhs = -(r_min - r0)          # = r0 - r_min
+                config.lmpc_rows.append(
+                    LmpcRow(cid=cid, rhs=rhs, terms=[(nid, 1, -ax), (nid, 2, -ay)])
+                )
+                cid += 1
+                count += 1
+            print(f"  LMPC min_radius={r_min}: {count} constraints added")
+
+        elif ctype == "custom":
+            nid   = int(spec["nid"])
+            dof   = int(spec["dof"])
+            coeff = float(spec["coeff"])
+            rhs   = float(spec["rhs"])
+            terms = [(nid, dof, coeff)]
+            if "nid2" in spec:
+                terms.append((int(spec["nid2"]), int(spec["dof2"]),
+                               float(spec["coeff2"])))
+            config.lmpc_rows.append(LmpcRow(cid=cid, rhs=rhs, terms=terms))
+            cid += 1
+
+        else:
+            print(f"  WARNING: unknown LMPC type '{ctype}' — skipped")
+
+    # ── Point forces ──────────────────────────────────────────────────────────
+    if forces:
+        print("\n  -- FORCES --")
+    for entry in forces:
+        query, fvec = entry
+        fx, fy, fz = float(fvec[0]), float(fvec[1]), float(fvec[2])
+        if isinstance(query, NodeQuery):
+            nids = query.resolve(all_nodes, label="FORCE")
+        else:
+            nids = sorted(query)
+        for nid in nids:
+            config.force_bcs.append((nid, fx, fy, fz))
+
     print()
     print(f"  ModelConfig: {len(config.disp_bcs)} DISP BCs, "
           f"{len(config.lmpc_rows)} LMPC rows, "
@@ -391,6 +417,24 @@ def add_physics(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _resolve_lmpc_nodes(
+    spec:      dict,
+    all_nodes: dict,
+    surrogate: "Surrogate",
+) -> set[int]:
+    """Return the node IDs an LMPC constraint applies to.
+
+    If the spec has a ``nodes`` key (NodeQuery or iterable of IDs), resolve it
+    against all_nodes.  Otherwise fall back to all membrane nodes in the surrogate.
+    """
+    if "nodes" in spec:
+        query = spec["nodes"]
+        if isinstance(query, NodeQuery):
+            return set(query.resolve(all_nodes, label="LMPC"))
+        return set(query)
+    return _membrane_nids(surrogate)
+
 
 def _rp(xyz) -> tuple:
     return (round(xyz[0], _COORD_DIGITS),
