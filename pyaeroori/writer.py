@@ -57,14 +57,14 @@ class SimConfig:
     project_name:    str   = "AeroOrigami"
     sim_name:        str   = "origami_fold"
 
-    # Newmark time integration
+    # Generalized-alpha time integration
     time_step:       float = 5e-5     # dt
     end_time:        float = 1.0      # ENDTIME
     rho:             float = 0.7      # RHO — numerical dissipation
 
     # Rayleigh damping
-    alpha_damp:      float = 1e-7     # ADAMP (mass proportional)
-    beta_damp:       float = 2.0      # BDAMP (stiffness proportional)
+    a_damp:      float = 1e-7     # ADAMP (stiffness proportional)
+    b_damp:       float = 2.0      # BDAMP (mass proportional)
 
     # Solver / constraints
     solver:          str   = "sparse" # SOLVERNAME
@@ -184,6 +184,8 @@ def write_aeros(
         _write_input_file(sim, config, out, p)
         written["input"] = p
         print(f"  Wrote {p.name}")
+
+        _write_cluster_scripts(sim, out)
 
     return written
 
@@ -487,7 +489,7 @@ def _write_input_file(
     L("newmark")
     L(f"mech {sim.rho}")
     L(f"time 0 {sim.time_step:.6e} {sim.end_time:.6e}")
-    L(f"RAYDAMP {sim.alpha_damp:.6e} {sim.beta_damp:.6e}")
+    L(f"RAYDAMP {sim.a_damp:.6e} {sim.b_damp:.6e}")
     L(sep)
     L("STATICS")
     L(f"{sim.solver}")
@@ -535,3 +537,84 @@ def _write_eframes(rev_joints: list["JointInfo"], path: Path) -> None:
                 f"  {e3[0]:.6e} {e3[1]:.6e} {e3[2]:.6e}\n"
             )
         f.write("*\n")
+
+
+# ── Cluster script templates ───────────────────────────────────────────────────
+
+_RUN_SH = """\
+#!/bin/bash
+# ── Paths — update to match your cluster installation ────────────────────────
+AEROS=/home/rtezaur/codes/aero-s/build/bin/aeros
+AEROSDIR=/home/pavery/Codes/FEM
+GSLDIR=/home/tdurrant/GSL
+EIGENDIR=/home/tdurrant/eigen-3.4.0
+
+# Ensure AERO-S output directories exist
+mkdir -p postpro references results
+
+# Compile USDF shared library if present
+if [ -f control.C ]; then
+    g++ -O3 -fPIC -D_TEMPLATE_FIX_ \\
+        -I$AEROSDIR \\
+        -I$AEROSDIR/Control.d \\
+        -I$AEROSDIR/Math.d \\
+        -I$AEROSDIR/Utils.d \\
+        -I$AEROSDIR/SysState.d \\
+        -I$GSLDIR/include \\
+        -I$EIGENDIR \\
+        -c control.C && \\
+    g++ -shared control.o -o control.so
+fi
+
+$AEROS -q fold.fem |& tee log.out
+"""
+
+_RUN_SBATCH = """\
+#!/bin/bash
+#SBATCH --job-name={sim_name}
+#SBATCH --output=log.out
+#SBATCH --error=log.err
+#SBATCH --time=23:59:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
+
+chmod 755 run.sh
+./run.sh
+"""
+
+_POSTPRO_SH = """\
+#!/bin/bash
+#SBATCH --job-name=postpro
+#SBATCH --output=postpro.log
+#SBATCH --error=postpro.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=12
+#SBATCH --time=1:00:00
+
+# ── Paths — update to match your cluster installation ────────────────────────
+AEROS=/home/rtezaur/codes/aero-s/build/bin/aeros
+XP2EXO=/home/pavery/bin/xp2exo
+
+# Generate topology file and convert to Exodus for ParaView
+$AEROS -t fold.fem
+$XP2EXO {sim_name}.top postpro/{sim_name}.exo results/gdisplac3.xpost
+"""
+
+_CLEAN_SH = """\
+#!/bin/bash
+# Removes all AERO-S output, keeping the directory structure intact.
+rm -f log.out log.err postpro.log postpro.err
+rm -f residuals *.timing *.top control.o control.so
+rm -f postpro/*
+rm -f results/*
+rm -f references/*
+"""
+
+
+def _write_cluster_scripts(sim: SimConfig, out: Path) -> None:
+    """Write run.sh, run.sbatch, postpro.sh, clean.sh into the sim dir."""
+    (out / "run.sh").write_text(_RUN_SH)
+    (out / "run.sbatch").write_text(_RUN_SBATCH.format(sim_name=sim.sim_name))
+    (out / "postpro.sh").write_text(_POSTPRO_SH.format(sim_name=sim.sim_name))
+    (out / "clean.sh").write_text(_CLEAN_SH)
+    print("  Wrote run.sh, run.sbatch, postpro.sh, clean.sh")

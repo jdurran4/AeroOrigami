@@ -1,7 +1,7 @@
 """
 DGB Parachute — AeroOrigami pipeline driver
 ============================================
-Demonstrates Steps 1–3 for the DGB parachute with Miura-Ori creases.
+Demonstrates Steps 1–6 for the DGB parachute with Miura-Ori creases.
 Run from the AeroOrigami root directory:
 
     python examples/dgb_parachute/run.py
@@ -38,12 +38,12 @@ mesh_file        = HERE / "dgb_mesh.fem"
 disk_crease_file = HERE / "dgb_disk_creases.csv"
 band_crease_file = HERE / "dgb_band_creases.csv"
 
-mesh_size          = 0.22    # Target element size for Gmsh remesh (Path A, metres)
+mesh_size          = 0.22    # Target element size for Gmsh remesh (Path A, meters)
 penalty_stiffness  = 8e9
 actuator_ramp_time = 3.0
 min_radius         = 0.05
 include_cables     = True
-output_dir         = HERE / "results"
+output_dir         = HERE / "sim_files"
 
 # =============================================================================
 # STEP 1 — Load the original mesh
@@ -109,9 +109,9 @@ disk_region = Region(disk_creases, name="disk", use_crease_mesh=True)
 band_region = Region(band_creases, name="band", use_crease_mesh=True)
 coarse      = remesh(mesh, disk_region, band_region, show=True)
 
-print(f"  Coarse mesh : {len(coarse.nodes)} nodes, "
-      f"{len(coarse.elements)} elements, "
-      f"{len(set(coarse.panel_map.values()))} panels")
+# print(f"  Coarse mesh : {len(coarse.nodes)} nodes, "
+#       f"{len(coarse.elements)} elements, "
+#       f"{len(set(coarse.panel_map.values()))} panels")
 
 # ── Path A alternative ───────────────────────────────────────────────────────
 # disk_region_a = Region(disk_creases, mesh_size=mesh_size, name="disk")
@@ -144,10 +144,10 @@ surrogate = build_surrogate(
     # vertex_joint_type=126,  # force revolute at all crease endpoints (Path A research)
 )
 
-print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
-print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
+# print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
+# print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
 
-plot_surrogate_axes(surrogate, title="DGB Parachute — Hinge Axes (Step 4)",arrow_length=0.1)
+# plot_surrogate_axes(surrogate, title="DGB Parachute — Hinge Axes (Step 4)",arrow_length=0.1)
 
 # =============================================================================
 # STEP 5 — Add physics (BCs, loads, cables)
@@ -163,11 +163,13 @@ config = add_physics(
     surrogate,
     mesh=mesh,                          # required for block= and all_bars= lookups
     disp=[
-        # Vent ring: pin xyz translation to keep apex in place
-        (N.along_line((0,0,47.5), (0,0,47.5), tol=0.02), [1, 2, 3]),
+        # Triple bridle: pin all DOF to keep connection to payload
+        (N.near(x=-0.146,y=-0.253,z=-0.738,tol=0.1), [1, 2, 3, 4, 5, 6]),
+        (N.near(x=0.292,y=0.0,z=-0.738,tol=0.05), [1, 2, 3, 4, 5, 6]),
+        (N.near(x=-0.146,y=0.253,z=-0.738,tol=0.05), [1, 2, 3, 4, 5, 6]),
     ],
     lmpc=[
-        {"type": "min_z",      "z_min":  40.0},
+        {"type": "min_z",      "z_min":  46.7, "nodes": N.above(z=46.8)},
         {"type": "min_radius", "r_min":   0.1},
     ],
     cables=[
@@ -190,19 +192,18 @@ print("=" * 50)
 print("STEP 6 — Write AEROS files")
 print("=" * 50)
 
-# Without simulation config (fold geometry only):
-write_aeros(surrogate, output_dir=output_dir)
-
-# With physics + simulation config (uncomment and adjust after Step 5 above):
+# Physics + simulation config:
 sim = SimConfig(
     project_name    = "DGB_Parachute",
     sim_name        = "dgb_fold",
-    end_time        = 1.0,
+    end_time        = 14.0,
     shell_E         = 1e7,
     shell_nu        = 0.4,
     shell_rho       = 40000.0,
     shell_t         = 1.0,
-    cable_stiffness = 10000.0,
+    cable_stiffness = 100000.0,
+    a_damp          = 1e-7,
+    b_damp          = 2.0,
 )
 write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
 
