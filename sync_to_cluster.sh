@@ -2,7 +2,7 @@
 # Sync a sim_files directory to your computing cluster.
 #
 # Usage:
-#   ./sync_to_cluster.sh <example> <run_name>
+#   ./sync_to_cluster.sh <simulation_dir> <run_name>
 #   ./sync_to_cluster.sh examples/dgb_parachute dgb_v1
 #
 # The run_name becomes the directory name on the cluster.
@@ -13,14 +13,14 @@ HOST=independence2
 REMOTE_BASE=/home/tdurrant/parachute/aeroorigami
 
 # ── Args ──────────────────────────────────────────────────────────────────────
-EXAMPLE=${1:?Usage: $0 <example_dir> <run_name>}
-RUNNAME=${2:?Usage: $0 <example_dir> <run_name>}
+SIMULATION=${1:?Usage: $0 <simulation_dir> <run_name>}
+RUNNAME=${2:?Usage: $0 <simulation_dir> <run_name>}
 
-SIM_FILES="$EXAMPLE/sim_files"
+SIM_FILES="$SIMULATION/sim_files"
 REMOTE="$HOST:$REMOTE_BASE/$RUNNAME"
 
 if [ ! -d "$SIM_FILES" ]; then
-    echo "Error: $SIM_FILES does not exist. Run the example script first."
+    echo "Error: $SIM_FILES does not exist. Run the simulation script first."
     exit 1
 fi
 

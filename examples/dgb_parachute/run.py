@@ -24,6 +24,7 @@ from pyaeroori.plot import (
     plot_creases_on_mesh,
     check_crease_coverage,
     check_mesh_crease_resolution,
+    plot_panel_colors,
     plot_surrogate_axes,
     plot_physics,
 )
@@ -39,7 +40,7 @@ disk_crease_file = HERE / "dgb_disk_creases.csv"
 band_crease_file = HERE / "dgb_band_creases.csv"
 
 mesh_size          = 0.22    # Target element size for Gmsh remesh (Path A, meters)
-penalty_stiffness  = 8e9
+penalty_stiffness  = 1e7
 actuator_ramp_time = 3.0
 min_radius         = 0.05
 include_cables     = True
@@ -105,8 +106,10 @@ print("STEP 3 — Remesh  [Path B: crease-as-mesh]")
 print("=" * 50)
 
 output_dir.mkdir(exist_ok=True)
-disk_region = Region(disk_creases, name="disk", use_crease_mesh=True)
+disk_region = Region(disk_creases, name="disk", use_crease_mesh=True,
+                     outward_normal=(0, 0, 1))  # disk is flat; auto-detect fails for planar surfaces
 band_region = Region(band_creases, name="band", use_crease_mesh=True)
+                     # band is cylindrical — outward normal auto-detected from geometry
 coarse      = remesh(mesh, disk_region, band_region, show=True)
 
 # print(f"  Coarse mesh : {len(coarse.nodes)} nodes, "
@@ -128,7 +131,7 @@ coarse      = remesh(mesh, disk_region, band_region, show=True)
 
 # =============================================================================
 # STEP 4 — Build surrogate (node duplication + driver joints)
-# =============================================================================
+# =============================================================================f
 
 print()
 print("=" * 50)
@@ -144,10 +147,11 @@ surrogate = build_surrogate(
     # vertex_joint_type=126,  # force revolute at all crease endpoints (Path A research)
 )
 
-# print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
-# print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
+print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
+print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
 
-# plot_surrogate_axes(surrogate, title="DGB Parachute — Hinge Axes (Step 4)",arrow_length=0.1)
+plot_panel_colors(coarse, surrogate, title="DGB Parachute — Panel 2-Coloring (Step 4)")
+plot_surrogate_axes(surrogate, title="DGB Parachute — Hinge Axes (Step 4)", arrow_length=0.1)
 
 # =============================================================================
 # STEP 5 — Add physics (BCs, loads, cables)
@@ -197,15 +201,15 @@ sim = SimConfig(
     project_name    = "DGB_Parachute",
     sim_name        = "dgb_fold",
     end_time        = 14.0,
-    shell_E         = 1e7,
+    shell_E         = 1e6,
     shell_nu        = 0.4,
-    shell_rho       = 40000.0,
+    shell_rho       = 4000.0,
     shell_t         = 1.0,
-    cable_stiffness = 100000.0,
+    cable_stiffness = 10000.0,
     a_damp          = 1e-7,
     b_damp          = 2.0,
 )
-write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
+write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim, beta_factor=1.0)
 
 print(f"Done. Files written to {output_dir}")
 
