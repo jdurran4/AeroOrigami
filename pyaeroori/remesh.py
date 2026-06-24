@@ -70,6 +70,7 @@ class Region:
     projection:      str   = "auto"
     name:            str   = ""
     use_crease_mesh: bool  = False
+    outward_normal:  tuple | None = None  # hint for build_surrogate panel-normal orientation
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,8 +362,9 @@ def _crease_path(regions: list[Region]) -> Mesh:
             node_xyz[nid]    = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
         return snap_to_nid[key]
 
-    elements:  dict[int, tuple[int, list[int]]] = {}
-    panel_map: dict[int, int]                   = {}
+    elements:           dict[int, tuple[int, list[int]]] = {}
+    panel_map:          dict[int, int]                   = {}
+    panel_outward_hints: dict[int, tuple]                = {}
     eid      = 1
     panel_id = 1
 
@@ -399,11 +401,14 @@ def _crease_path(regions: list[Region]) -> Mesh:
                     panel_map[eid] = panel_id
                     eid += 1
 
+            if region.outward_normal is not None:
+                panel_outward_hints[panel_id] = tuple(region.outward_normal)
             panel_id += 1
 
         print(f"  Region '{region.name}': {panel_id - 1 - n_before} panels")
 
-    return Mesh(nodes=node_xyz, elements=elements, panel_map=panel_map)
+    return Mesh(nodes=node_xyz, elements=elements, panel_map=panel_map,
+                panel_outward_hints=panel_outward_hints)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -541,14 +546,29 @@ def _make_angle_fn(
 # Face filtering
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _signed_area_2d(face: list[int], coords2d: dict) -> float:
-    """Shoelace signed area.  Positive = CCW = interior face."""
+def _signed_area_2d(face: list[int], coords2d: dict,
+                    unwrap_u: bool = False) -> float:
+    """Shoelace signed area.  Positive = CCW = interior face.
+
+    unwrap_u: when True, the u-coordinate (theta for cylindrical) is
+    incrementally unwrapped before the shoelace sum so that faces straddling
+    the ±π seam get the correct sign.
+    """
+    n = len(face)
+    us = [coords2d[face[i]][0] for i in range(n)]
+    vs = [coords2d[face[i]][1] for i in range(n)]
+
+    if unwrap_u:
+        unwrapped = [us[0]]
+        for i in range(1, n):
+            du = us[i] - us[i - 1]
+            du = (du + math.pi) % (2 * math.pi) - math.pi
+            unwrapped.append(unwrapped[-1] + du)
+        us = unwrapped
+
     area = 0.0
-    n    = len(face)
     for i in range(n):
-        u = coords2d[face[i]]
-        v = coords2d[face[(i + 1) % n]]
-        area += u[0] * v[1] - v[0] * u[1]
+        area += us[i] * vs[(i + 1) % n] - us[(i + 1) % n] * vs[i]
     return area * 0.5
 
 
@@ -581,12 +601,13 @@ def _filter_faces(
     """
     keep: list[list[int]] = []
 
+    cyl = (proj == "cylindrical")
     for face in faces:
         if len(set(face)) < 3:
             continue
-        if _signed_area_2d(face, coords2d) <= 0:
+        if _signed_area_2d(face, coords2d, unwrap_u=cyl) <= 0:
             continue
-        if proj == "cylindrical":
+        if cyl:
             hs = [coords2d[p][1] for p in face]
             if max(hs) - min(hs) < 1e-6:
                 continue

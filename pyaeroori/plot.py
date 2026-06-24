@@ -366,6 +366,90 @@ def check_mesh_crease_resolution(
 
 # ── Step 4: surrogate visualization ──────────────────────────────────────────
 
+def plot_panel_colors(
+    coarse:    "Mesh",
+    surrogate: "Surrogate",
+    title:     str = "Panel 2-Coloring (Step 4)",
+    show:      bool = True,
+):
+    """
+    Filled 3-D polygon plot of the coarse mesh panels colored by their BFS
+    2-coloring assignment (color-0 = steelblue, color-1 = coral).
+
+    Use this to verify that the 2-coloring is consistent: no two adjacent
+    panels across a crease should share the same color.
+
+    Parameters
+    ----------
+    coarse    : Mesh returned by remesh() — contains panel_map and geometry
+    surrogate : Surrogate returned by build_surrogate() — contains panel_colors
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    panel_colors = surrogate.panel_colors
+
+    # Group original coarse elements by panel_id
+    panel_elems: dict[int, list[int]] = {}
+    for eid, pid in coarse.panel_map.items():
+        panel_elems.setdefault(pid, []).append(eid)
+
+    color0_polys: list = []
+    color1_polys: list = []
+
+    for pid, eids in panel_elems.items():
+        c = panel_colors.get(pid, 0)
+        for eid in eids:
+            if eid not in coarse.elements:
+                continue
+            nids = coarse.elements[eid][1]
+            verts = np.array([coarse.nodes[n] for n in nids], dtype=float)
+            if c == 0:
+                color0_polys.append(verts)
+            else:
+                color1_polys.append(verts)
+
+    fig = plt.figure(figsize=(11, 9))
+    ax  = fig.add_subplot(111, projection="3d")
+
+    if color0_polys:
+        col0 = Poly3DCollection(
+            color0_polys,
+            facecolors="steelblue", edgecolors="k",
+            alpha=0.55, linewidths=0.3,
+        )
+        col0.set_label(f"Color-0 panels ({len(panel_elems) - sum(1 for p in panel_colors.values() if p == 1)})")
+        ax.add_collection3d(col0)
+
+    if color1_polys:
+        col1 = Poly3DCollection(
+            color1_polys,
+            facecolors="coral", edgecolors="k",
+            alpha=0.55, linewidths=0.3,
+        )
+        col1.set_label(f"Color-1 panels ({sum(1 for p in panel_colors.values() if p == 1)})")
+        ax.add_collection3d(col1)
+
+    # Auto-scale axes from coarse node coordinates
+    coords = np.array(list(coarse.nodes.values()))
+    for dim, setter in enumerate((ax.set_xlim, ax.set_ylim, ax.set_zlim)):
+        setter(coords[:, dim].min(), coords[:, dim].max())
+
+    # Count panels per color for the title annotation
+    n0 = sum(1 for c in panel_colors.values() if c == 0)
+    n1 = sum(1 for c in panel_colors.values() if c == 1)
+
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+    ax.set_title(f"{title}  ({n0} color-0 + {n1} color-1 = {n0+n1} panels)")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
 def plot_surrogate_axes(
     surrogate: "Surrogate",
     title: str = "Surrogate — Crease Hinge Axes (Step 4)",

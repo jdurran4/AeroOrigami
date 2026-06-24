@@ -96,7 +96,7 @@ def _aeros_etype(nids: list[int]) -> int:
     if n == 3:
         return 15      # triangular AQR shell
     if n == 4:
-        return 1515    # quadrilateral AQR shell
+        return 1515    # quad shell — only reached when split_quads=False
     raise ValueError(f"No AERO-S shell type for {n}-node element")
 
 
@@ -107,7 +107,7 @@ def write_aeros(
     output_dir:  str | Path,
     config:      "ModelConfig | None" = None,
     sim:         SimConfig | None = None,
-    beta_factor: float = 0.1,
+    beta_factor: float = 1.0,
 ) -> dict[str, Path]:
     """
     Write AERO-S include files for the fold surrogate.
@@ -575,7 +575,7 @@ _RUN_SBATCH = """\
 #!/bin/bash
 #SBATCH --job-name={sim_name}
 #SBATCH --output=log.out
-#SBATCH --error=log.err
+#SBATCH --error=error.err
 #SBATCH --time=23:59:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2

@@ -24,10 +24,11 @@ class Mesh:
     """
     nodes:      dict[int, tuple[float, float, float]]
     elements:   dict[int, tuple[int, list[int]]]
-    panel_map:  dict[int, int]  = field(default_factory=dict)
-    path:       str             = field(default="")   # "A" (Gmsh) or "B" (crease-as-mesh)
-    blocks:     dict[str, list[int]] = field(default_factory=dict)  # block name → [seq_eid]
-    attributes: dict[int, int]  = field(default_factory=dict)       # seq_eid → attr_id
+    panel_map:           dict[int, int]  = field(default_factory=dict)
+    path:                str             = field(default="")   # "A" (Gmsh) or "B" (crease-as-mesh)
+    blocks:              dict[str, list[int]] = field(default_factory=dict)  # block name → [seq_eid]
+    attributes:          dict[int, int]  = field(default_factory=dict)       # seq_eid → attr_id
+    panel_outward_hints: dict[int, tuple] = field(default_factory=dict)      # panel_id → outward normal hint
 
     # ------------------------------------------------------------------
     # Derived views (computed on access, not stored)

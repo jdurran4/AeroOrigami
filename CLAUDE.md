@@ -62,7 +62,10 @@ All public exports are in `pyaeroori/__init__.py`.
 
 - **`surrogate.py`**: BFS panel detection, 2-coloring, node duplication. Revolute
   joints (type 126) on interior crease nodes; spherical joints (type 120) on boundary
-  and junction nodes.
+  and junction nodes. `split_quads=True` (default): any 4-node quad panels are
+  fan-split into two triangles (along the 0–2 diagonal) after node duplication; both
+  triangles share the same `panel_id` so no joint is placed between them. Set
+  `split_quads=False` to emit type-1515 quad shell elements instead.
 
 - **`physics.py`**: `add_physics(surrogate, mesh, disp, lmpc, forces, cables)`.
   Processing order: cables first, then DISP/LMPC/forces — so cable endpoint nodes

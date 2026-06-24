@@ -11,7 +11,7 @@ the actual AERO-S include files.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -28,8 +28,8 @@ _COORD_DIGITS = 4
 class JointInfo:
     """One joint element connecting two copies of a duplicated crease node."""
     eid:          int
-    node_a:       int           # lower-panel-id side
-    node_b:       int           # higher-panel-id side (or dup)
+    node_a:       int           # color-0 side (original node)
+    node_b:       int           # color-1 side (duplicate node)
     jtype:        int           # 120 = spherical, 126 = revolute driver
     axis:         tuple | None  # unit crease axis (revolute only)
     target_angle: float         # signed radians (+mountain, -valley)
@@ -54,6 +54,7 @@ class Surrogate:
     elements:          dict[int, tuple[int, list[int]]]
     joints:            list[JointInfo]
     panel_map:         dict[int, int]
+    panel_colors:      dict[int, int]   # panel_id → 0 or 1 (BFS 2-coloring)
     penalty_stiffness: float
     actuator_ramp_time: float
 
@@ -74,6 +75,7 @@ def build_surrogate(
     penalty_stiffness:  float = 8e9,
     actuator_ramp_time: float = 3.0,
     vertex_joint_type:  int | None = None,
+    split_quads:        bool = True,
 ) -> Surrogate:
     """
     Step 4: duplicate crease nodes, build driver joints, compute hinge axes.
@@ -92,6 +94,11 @@ def build_surrogate(
                          In Path A, Gmsh-added interior crease nodes always get
                          126 regardless of this setting — only the segment
                          endpoint/junction nodes are affected.
+    split_quads        : if True (default), split every 4-node quad element into
+                         two triangles (fan from vertex 0) before joint
+                         construction.  Both triangles share the same panel_id so
+                         no joint is placed between them and the panel stays rigid.
+                         Set to False to keep type-1515 quad shell elements.
 
     Returns
     -------
@@ -157,14 +164,30 @@ def build_surrogate(
         node_cedges[va].append((vb, ps))
         node_cedges[vb].append((va, ps))
 
-    # ── 4. Duplicate crease nodes ─────────────────────────────────────────────
-    # dup_map[(orig_nid, panel_id)] = node_id to use for that panel
-    # Owner panel (lowest pid at that node) keeps the original node.
+    # ── 4. Build panel adjacency graph + BFS 2-color ─────────────────────────
+    # Panels are adjacent when they share a crease edge.
+    panel_adj: dict[int, set[int]] = defaultdict(set)
+    for ps in crease_edges.values():
+        pid_list = sorted(ps)
+        if len(pid_list) == 2:
+            panel_adj[pid_list[0]].add(pid_list[1])
+            panel_adj[pid_list[1]].add(pid_list[0])
+
+    all_pids = sorted(set(coarse.panel_map.values()))
+    panel_colors = _bfs_color_panels(all_pids, panel_adj)
+
+    # ── 5. Duplicate crease nodes ─────────────────────────────────────────────
+    # One duplicate per (vertex, non-owner panel).  Owner = min panel ID at v.
+    # This gives each panel its own unique node at every crease vertex, so
+    # all N crease edges at a degree-N vertex produce N distinct node pairs
+    # and N independent joint elements.
+    # 2-coloring is used only for axis direction and node_a/node_b ordering.
+    # dup_map[(orig_nid, panel_id)] = node_id to use for that panel.
     dup_map: dict[tuple[int, int], int] = {}
     new_nodes: dict[int, tuple[float, float, float]] = dict(coarse.nodes)
     next_nid = max(coarse.nodes) + 1
 
-    for v in crease_nids:
+    for v in sorted(crease_nids):
         owner = min(n2p[v])
         for pid in n2p[v]:
             if pid == owner:
@@ -174,7 +197,7 @@ def build_surrogate(
                 new_nodes[next_nid] = coarse.nodes[v]
                 next_nid += 1
 
-    # ── 5. Update element connectivity ───────────────────────────────────────
+    # ── 5b. Update element connectivity ──────────────────────────────────────
     new_elements: dict[int, tuple[int, list[int]]] = {}
     for eid, (etype, nids) in coarse.elements.items():
         pid = coarse.panel_map.get(eid)
@@ -184,7 +207,40 @@ def build_surrogate(
         new_nids = [dup_map.get((nid, pid), nid) for nid in nids]
         new_elements[eid] = (etype, new_nids)
 
-    # ── 6. Crease-segment angle lookup ───────────────────────────────────────
+    # ── 5b. Split quad elements into triangles ───────────────────────────────
+    n_quad_splits = 0
+    if split_quads:
+        split_elems: dict[int, tuple[int, list[int]]] = {}
+        split_pmap:  dict[int, int] = {}
+        _next_split_eid = max(new_elements) + 1
+        for eid, (etype, nids) in new_elements.items():
+            pid = coarse.panel_map.get(eid)
+            if len(nids) == 4:
+                n0, n1, n2, n3 = nids
+                split_elems[eid]               = (etype, [n0, n1, n2])
+                split_elems[_next_split_eid]   = (etype, [n0, n2, n3])
+                if pid is not None:
+                    split_pmap[eid]              = pid
+                    split_pmap[_next_split_eid]  = pid
+                _next_split_eid += 1
+                n_quad_splits += 1
+            else:
+                split_elems[eid] = (etype, nids)
+                if pid is not None:
+                    split_pmap[eid] = pid
+        new_elements = split_elems
+        panel_map_out = split_pmap
+    else:
+        panel_map_out = {eid: pid for eid, pid in coarse.panel_map.items()
+                         if eid in new_elements}
+
+    # ── 6. Panel normals + centroids for consistent axis computation ─────────
+    panel_normals, panel_centroids = _compute_panel_normals_centroids(
+        coarse.elements, coarse.nodes, coarse.panel_map, all_pids,
+        getattr(coarse, "panel_outward_hints", {}),
+    )
+
+    # ── 7. Crease-segment angle lookup ───────────────────────────────────────
     # Primary: key (rounded_p1, rounded_p2) → (angle, start_t, end_t)
     # Both directions stored.  Used when both endpoints match CSV endpoints.
     #
@@ -202,7 +258,7 @@ def build_surrogate(
         seg_list.append((np.asarray(p1, float), np.asarray(p2, float),
                          angle, start_t, end_t))
 
-    # ── 7. Build joint elements ───────────────────────────────────────────────
+    # ── 8. Build joint elements ───────────────────────────────────────────────
     joints: list[JointInfo] = []
     next_eid = max(new_elements) + 1
     seen_node_pairs: set[tuple[int, int]] = set()
@@ -218,11 +274,16 @@ def build_surrogate(
 
         for ps, others in pair_others.items():
             PA, PB = sorted(ps)
-            node_a = dup_map.get((v, PA), v)
-            node_b = dup_map.get((v, PB), v)
 
-            # Skip if this node pair already got a joint (e.g. both ends of a
-            # collinear crease produced the same physical node pair).
+            # Identify color-0 (original) and color-1 (duplicate) sides.
+            PA_color = panel_colors.get(PA, 0)
+            pid0 = PA if PA_color == 0 else PB   # color-0 panel
+            pid1 = PB if PA_color == 0 else PA   # color-1 panel
+
+            node_a = dup_map.get((v, pid0), v)   # original node (color-0)
+            node_b = dup_map.get((v, pid1), v)   # duplicate node (color-1)
+
+            # Skip if this node pair already got a joint (collinear segments).
             pair_key = (min(node_a, node_b), max(node_a, node_b))
             if pair_key in seen_node_pairs:
                 continue
@@ -238,19 +299,50 @@ def build_surrogate(
             else:
                 jtype = _vtx_jtype
 
-            # Crease axis: direction from v toward the first other endpoint.
-            # For collinear segments, pick the longest one for a stable axis.
+            # Crease axis — consistent convention via 2-coloring:
+            #   axis points along the crease such that the color-0 panel is on
+            #   the RIGHT when viewed from the outward surface normal.
+            #
+            #   x_raw = cross(d_01, n_avg)  where d_01 = centroid_1 - centroid_0
+            #   axis  = crease_tangent aligned with x_raw
             best_other = max(
                 others,
                 key=lambda w: np.linalg.norm(np.array(coarse.nodes[w]) - v_xyz),
             )
-            d = np.array(coarse.nodes[best_other]) - v_xyz
-            norm = float(np.linalg.norm(d))
-            axis = tuple(float(x) for x in d / norm) if norm > 1e-12 else (1.0, 0.0, 0.0)
+            other_xyz = np.array(coarse.nodes[best_other])
+            tang = other_xyz - v_xyz
+            tang_len = float(np.linalg.norm(tang))
+            tang = tang / tang_len if tang_len > 1e-12 else np.array([1., 0., 0.])
+
+            cA = panel_centroids.get(pid0, np.zeros(3))
+            cB = panel_centroids.get(pid1, np.zeros(3))
+            nA = panel_normals.get(pid0, np.array([0., 0., 1.]))
+            nB = panel_normals.get(pid1, np.array([0., 0., 1.]))
+
+            d01 = cB - cA
+            d01_len = float(np.linalg.norm(d01))
+            if d01_len > 1e-12:
+                d01 = d01 / d01_len
+                n_avg = nA + nB
+                n_avg_len = float(np.linalg.norm(n_avg))
+                if n_avg_len > 1e-12:
+                    n_avg = n_avg / n_avg_len
+                    x_raw = np.cross(d01, n_avg)
+                    x_raw_len = float(np.linalg.norm(x_raw))
+                    if x_raw_len > 1e-12:
+                        x_raw = x_raw / x_raw_len
+                        axis_arr = tang if float(np.dot(tang, x_raw)) > 0 else -tang
+                    else:
+                        axis_arr = tang
+                else:
+                    axis_arr = tang
+            else:
+                axis_arr = tang
+
+            axis = tuple(float(x) for x in axis_arr)
 
             # Look up target angle from the crease pattern.
-            other_xyz = np.array(coarse.nodes[best_other])
-            v_key    = _rp(coarse.nodes[v])
+            v_key     = _rp(coarse.nodes[v])
             other_key = _rp(coarse.nodes[best_other])
             angle_info = (seg_angle.get((v_key, other_key))
                           or seg_angle.get((other_key, v_key))
@@ -277,21 +369,108 @@ def build_surrogate(
 
     n_rev = sum(1 for j in joints if j.jtype == 126)
     n_sph = sum(1 for j in joints if j.jtype == 120)
+    split_note = f" ({n_quad_splits} quads → 2 tris each)" if n_quad_splits else ""
     print(f"  Surrogate : {len(new_nodes)} nodes (+{len(new_nodes)-len(coarse.nodes)} dups), "
-          f"{len(new_elements)} shell elements, "
+          f"{len(new_elements)} shell elements{split_note}, "
           f"{n_rev} revolute joints, {n_sph} spherical joints")
 
     return Surrogate(
         nodes=new_nodes,
         elements=new_elements,
         joints=joints,
-        panel_map=dict(coarse.panel_map),
+        panel_map=panel_map_out,
+        panel_colors=panel_colors,
         penalty_stiffness=penalty_stiffness,
         actuator_ramp_time=actuator_ramp_time,
     )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _bfs_color_panels(
+    panel_ids: list[int],
+    panel_adj: dict[int, set[int]],
+) -> dict[int, int]:
+    """BFS 2-color the panel adjacency graph. Origami panels are always bipartite."""
+    colors: dict[int, int] = {}
+    for start in panel_ids:
+        if start in colors:
+            continue
+        queue: deque[tuple[int, int]] = deque([(start, 0)])
+        while queue:
+            pid, color = queue.popleft()
+            if pid in colors:
+                if colors[pid] != color:
+                    raise ValueError(
+                        f"Panel graph is not bipartite at panel {pid} — "
+                        "crease pattern may be invalid"
+                    )
+                continue
+            colors[pid] = color
+            for nbr in panel_adj.get(pid, set()):
+                if nbr not in colors:
+                    queue.append((nbr, 1 - color))
+    return colors
+
+
+def _compute_panel_normals_centroids(
+    coarse_elems: dict,
+    coarse_nodes: dict,
+    panel_map: dict,
+    panel_ids: list[int],
+    outward_hints: dict,
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    """
+    Area-weighted panel normals + centroids oriented outward.
+
+    If outward_hints[pid] is set, that vector determines the outward side.
+    Otherwise orientation is determined by the sign of dot(n, centroid - center)
+    where center is the centroid of all un-hinted panel centroids.
+    """
+    panel_elems: dict[int, list] = defaultdict(list)
+    for eid, pid in panel_map.items():
+        if eid in coarse_elems:
+            panel_elems[pid].append(eid)
+
+    normals:   dict[int, np.ndarray] = {}
+    centroids: dict[int, np.ndarray] = {}
+
+    for pid in panel_ids:
+        n_sum = np.zeros(3)
+        c_sum = np.zeros(3)
+        a_sum = 0.0
+        for eid in panel_elems.get(pid, []):
+            nids = coarse_elems[eid][1]
+            if len(nids) < 3:
+                continue
+            pts = [np.asarray(coarse_nodes[n], float) for n in nids[:3]]
+            tri_n = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+            tri_a = 0.5 * float(np.linalg.norm(tri_n))
+            n_sum += tri_n
+            c_sum += ((pts[0] + pts[1] + pts[2]) / 3.0) * tri_a
+            a_sum += tri_a
+
+        nlen = float(np.linalg.norm(n_sum))
+        normals[pid]   = n_sum / nlen if nlen > 1e-12 else np.array([0., 0., 1.])
+        centroids[pid] = c_sum / a_sum if a_sum > 1e-12 else np.zeros(3)
+
+    # Orient outward: hinted panels first, then auto-detect remainder
+    hinted   = {pid for pid in panel_ids if pid in outward_hints}
+    unhinted = [pid for pid in panel_ids if pid not in outward_hints]
+
+    for pid in hinted:
+        hint = np.asarray(outward_hints[pid], float)
+        if float(np.dot(normals[pid], hint)) < 0:
+            normals[pid] = -normals[pid]
+
+    if unhinted:
+        center = np.mean([centroids[pid] for pid in unhinted], axis=0)
+        for pid in unhinted:
+            if float(np.dot(normals[pid], centroids[pid] - center)) < 0:
+                normals[pid] = -normals[pid]
+
+    return normals, centroids
+
 
 def _edge(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)

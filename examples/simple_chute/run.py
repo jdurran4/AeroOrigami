@@ -1,7 +1,7 @@
 """
 Simple Chute — AeroOrigami pipeline driver
 ==========================================
-Demonstrates Steps 1–3 for the flat rectangular membrane example.
+Demonstrates Steps 1–6 for the simple rectangular chute example.
 Run from the AeroOrigami root directory:
 
     python examples/simple_chute/run.py
@@ -21,6 +21,7 @@ from pyaeroori.plot import (
     plot_creases_on_mesh,
     check_crease_coverage,
     check_mesh_crease_resolution,
+    plot_panel_colors,
     plot_surrogate_axes,
     plot_physics,
 )
@@ -133,6 +134,7 @@ surrogate = build_surrogate(
 print(f"  Revolute joints : {len(surrogate.revolute_joints)}")
 print(f"  Spherical joints: {len(surrogate.spherical_joints)}")
 
+plot_panel_colors(coarse, surrogate, title="Simple Chute — Panel 2-Coloring (Step 4)")
 plot_surrogate_axes(surrogate, title="Simple Chute — Hinge Axes (Step 4)", arrow_length=0.5)
 
 # =============================================================================
@@ -147,24 +149,24 @@ plot_surrogate_axes(surrogate, title="Simple Chute — Hinge Axes (Step 4)", arr
 #
 # Uncomment and adjust coordinates to match your mesh:
 #
-# config = add_physics(
-#     surrogate,
-#     mesh=mesh,                        # required for all_bars cable detection
-#     disp=[
-#         # Pin top-edge nodes (z≈16, x=±0.8) — fix xyz translation
-#         (N.along_line((-0.8, 0, 16), (0.8, 0, 16), tol=0.05), [1, 2, 3]),
-#     ],
-#     lmpc=[
-#         {"type": "min_z", "z_min": -1.0},
-#     ],
-#     cables=[
-#         # The mesh has 4 suspension lines (type-6 beams) in the TOPOLOGY section
-#         # (no named blocks). all_bars detects them automatically and converts
-#         # each 5-element chain into a single type-203 tension-only spring.
-#         {"all_bars": True, "tol": 0.05},
-#     ],
-# )
-# plot_physics(surrogate, config, title="Simple Chute — Physics Overview (Step 5)")
+config = add_physics(
+    surrogate,
+    mesh=mesh,                        # required for all_bars cable detection
+    disp=[
+        # Pin top-edge nodes (z≈16, x=±0.8) — fix xyz translation
+        (N.along_line((-0.8, 0, 16), (0.8, 0, 16), tol=0.05), [1, 2, 3]),
+    ],
+    lmpc=[
+        {"type": "min_z", "z_min": -1.0},
+    ],
+    cables=[
+        # The mesh has 4 suspension lines (type-6 beams) in the TOPOLOGY section
+        # (no named blocks). all_bars detects them automatically and converts
+        # each 5-element chain into a single type-203 tension-only spring.
+        {"all_bars": True, "tol": 0.05},
+    ],
+)
+plot_physics(surrogate, config, title="Simple Chute — Physics Overview (Step 5)")
 
 # =============================================================================
 # STEP 6 — Write AEROS files
@@ -176,20 +178,20 @@ print("STEP 6 — Write AEROS files")
 print("=" * 50)
 
 # Without simulation config (fold geometry only):
-write_aeros(surrogate, output_dir=output_dir)
+# write_aeros(surrogate, output_dir=output_dir)
 
 # With physics + simulation config (uncomment and adjust after Step 5 above):
-# sim = SimConfig(
-#     project_name    = "Simple_Chute",
-#     sim_name        = "simple_chute_fold",
-#     end_time        = 1.0,
-#     shell_E         = 1e7,
-#     shell_nu        = 0.4,
-#     shell_rho       = 40000.0,
-#     shell_t         = 1.0,
-#     cable_stiffness = 10000.0,
-# )
-# write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
+sim = SimConfig(
+    project_name    = "Simple_Chute",
+    sim_name        = "simple_chute_fold",
+    end_time        = 1.0,
+    shell_E         = 1e7,
+    shell_nu        = 0.4,
+    shell_rho       = 40000.0,
+    shell_t         = 1.0,
+    cable_stiffness = 10000.0,
+)
+write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
 
 print(f"Done. Files written to {output_dir}")
 
