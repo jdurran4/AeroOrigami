@@ -506,8 +506,8 @@ def _write_input_file(
     L(sep)
     L("OUTPUT")
     L(f'gdisplac "results/gdisplac3.xpost" {sim.output_freq}')
-    L(f'stressvm "results/stressvm1.xpost" {sim.output_freq}')
-    L(f'strainvm "results/strainvm1.xpost" {sim.output_freq}')
+    L(f'stressp1 "results/stressp1.xpost" {sim.output_freq}')
+    L(f'strainp1 "results/strainp1.xpost" {sim.output_freq}')
     L(sep)
     L("* 6-DOF output for initial conditions of inflation simulation (Step 7)")
     L("OUTPUT6")
@@ -599,7 +599,7 @@ XP2EXO=/home/pavery/bin/xp2exo
 
 # Generate topology file and convert to Exodus for ParaView
 $AEROS -t fold.fem
-$XP2EXO {sim_name}.top postpro/{sim_name}.exo results/gdisplac3.xpost
+$XP2EXO {sim_name}.top postpro/{sim_name}.exo results/gdisplac3.xpost results/stressp1.xpost results/strainp1.xpost
 """
 
 _CLEAN_SH = """\

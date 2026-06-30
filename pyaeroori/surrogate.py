@@ -23,6 +23,22 @@ if TYPE_CHECKING:
 # rounding decimals for coordinate key matching
 _COORD_DIGITS = 4
 
+# When split_quads=True, skip splitting any quad whose best diagonal produces a
+# triangle with min angle below this (keep as type-1515 quad instead).
+_MIN_SPLIT_ANGLE_DEG = 5.0
+
+
+def _tri_min_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Minimum interior angle (radians) of a triangle given 3-D vertex arrays."""
+    s = np.array([np.linalg.norm(b - a), np.linalg.norm(c - b), np.linalg.norm(a - c)])
+    if s.min() < 1e-12:
+        return 0.0
+    cos_a = (s[0]**2 + s[2]**2 - s[1]**2) / (2 * s[0] * s[2])
+    cos_b = (s[0]**2 + s[1]**2 - s[2]**2) / (2 * s[0] * s[1])
+    ang_a = float(np.arccos(np.clip(cos_a, -1.0, 1.0)))
+    ang_b = float(np.arccos(np.clip(cos_b, -1.0, 1.0)))
+    return min(ang_a, ang_b, np.pi - ang_a - ang_b)
+
 
 @dataclass
 class JointInfo:
@@ -76,6 +92,7 @@ def build_surrogate(
     actuator_ramp_time: float = 3.0,
     vertex_joint_type:  int | None = None,
     split_quads:        bool = True,
+    fold_fraction:      float = 1.0,
 ) -> Surrogate:
     """
     Step 4: duplicate crease nodes, build driver joints, compute hinge axes.
@@ -99,6 +116,9 @@ def build_surrogate(
                          construction.  Both triangles share the same panel_id so
                          no joint is placed between them and the panel stays rigid.
                          Set to False to keep type-1515 quad shell elements.
+    fold_fraction      : scale factor applied to every target fold angle from the
+                         CSV (default 1.0 = full fold).  Set to e.g. 0.9 for 90 %
+                         of the prescribed angles.
 
     Returns
     -------
@@ -208,7 +228,9 @@ def build_surrogate(
         new_elements[eid] = (etype, new_nids)
 
     # ── 5b. Split quad elements into triangles ───────────────────────────────
-    n_quad_splits = 0
+    n_quad_splits  = 0
+    n_quad_kept    = 0
+    _min_split_rad = np.radians(_MIN_SPLIT_ANGLE_DEG)
     if split_quads:
         split_elems: dict[int, tuple[int, list[int]]] = {}
         split_pmap:  dict[int, int] = {}
@@ -217,13 +239,36 @@ def build_surrogate(
             pid = coarse.panel_map.get(eid)
             if len(nids) == 4:
                 n0, n1, n2, n3 = nids
-                split_elems[eid]               = (etype, [n0, n1, n2])
-                split_elems[_next_split_eid]   = (etype, [n0, n2, n3])
-                if pid is not None:
-                    split_pmap[eid]              = pid
-                    split_pmap[_next_split_eid]  = pid
-                _next_split_eid += 1
-                n_quad_splits += 1
+                p0 = np.array(new_nodes[n0], dtype=float)
+                p1 = np.array(new_nodes[n1], dtype=float)
+                p2 = np.array(new_nodes[n2], dtype=float)
+                p3 = np.array(new_nodes[n3], dtype=float)
+                # Both candidate splits; pick the one with the better min angle.
+                min02 = min(_tri_min_angle(p0, p1, p2), _tri_min_angle(p0, p2, p3))
+                min13 = min(_tri_min_angle(p0, p1, p3), _tri_min_angle(p1, p2, p3))
+                best  = max(min02, min13)
+                if best < _min_split_rad:
+                    # Both splits produce a degenerate triangle — keep as quad.
+                    split_elems[eid] = (etype, list(nids))
+                    if pid is not None:
+                        split_pmap[eid] = pid
+                    n_quad_kept += 1
+                elif min13 > min02:
+                    split_elems[eid]             = (etype, [n0, n1, n3])
+                    split_elems[_next_split_eid] = (etype, [n1, n2, n3])
+                    if pid is not None:
+                        split_pmap[eid]             = pid
+                        split_pmap[_next_split_eid] = pid
+                    _next_split_eid += 1
+                    n_quad_splits += 1
+                else:
+                    split_elems[eid]             = (etype, [n0, n1, n2])
+                    split_elems[_next_split_eid] = (etype, [n0, n2, n3])
+                    if pid is not None:
+                        split_pmap[eid]             = pid
+                        split_pmap[_next_split_eid] = pid
+                    _next_split_eid += 1
+                    n_quad_splits += 1
             else:
                 split_elems[eid] = (etype, nids)
                 if pid is not None:
@@ -353,6 +398,7 @@ def build_surrogate(
                     _warn_no_angle(v, coarse.nodes[v])
             else:
                 angle_rad, start_t, end_t = angle_info
+                angle_rad *= fold_fraction
 
             joints.append(JointInfo(
                 eid=next_eid,
@@ -369,7 +415,10 @@ def build_surrogate(
 
     n_rev = sum(1 for j in joints if j.jtype == 126)
     n_sph = sum(1 for j in joints if j.jtype == 120)
-    split_note = f" ({n_quad_splits} quads → 2 tris each)" if n_quad_splits else ""
+    split_parts = []
+    if n_quad_splits: split_parts.append(f"{n_quad_splits} quads → 2 tris")
+    if n_quad_kept:   split_parts.append(f"{n_quad_kept} quads kept (thin split avoided)")
+    split_note = f" ({', '.join(split_parts)})" if split_parts else ""
     print(f"  Surrogate : {len(new_nodes)} nodes (+{len(new_nodes)-len(coarse.nodes)} dups), "
           f"{len(new_elements)} shell elements{split_note}, "
           f"{n_rev} revolute joints, {n_sph} spherical joints")

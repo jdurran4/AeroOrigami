@@ -44,8 +44,10 @@ import numpy as np
 from .mesh import Mesh
 from .crease import CreasePattern
 
-_SNAP_TOL       = 1e-6
-_EXT_AREA_RATIO = 8.0
+_NODE_MERGE_TOL = 1e-2   # 1 cm: snap near-coincident nodes together (coarser than element spacing)
+_TJUNC_TOL      = 1e-6   # 1 μm: T-junction interior parametric / distance threshold
+_EXT_AREA_RATIO = 8.0    # remove faces larger than 8× median (exterior rings)
+_MIN_AREA_RATIO = 0.001  # remove faces smaller than 0.1% of median (sliver backstop)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +233,22 @@ def _find_panels(
 
     if len(pid_xyz) < 3:
         return [], pid_xyz, {}, projection
+
+    # Diagnostic: flag edges that are suspiciously short relative to the median.
+    # These usually mean a crease endpoint didn't snap to its intended boundary node.
+    _edge_lengths = sorted(
+        float(np.linalg.norm(pid_xyz[a] - pid_xyz[b]))
+        for a in adj for b in adj[a] if a < b
+    )
+    if _edge_lengths:
+        _med_edge = float(np.median(_edge_lengths))
+        _short    = [L for L in _edge_lengths if L < _med_edge * 0.05]
+        if _short:
+            print(f"    WARNING: {len(_short)} edge(s) shorter than 5% of median "
+                  f"({_med_edge:.4f} m): "
+                  + ", ".join(f"{L:.5f} m" for L in _short[:5])
+                  + (" ..." if len(_short) > 5 else "")
+                  + " — consider fixing crease CSV alignment or increasing _NODE_MERGE_TOL")
 
     pts  = np.array(list(pid_xyz.values()))
     proj = _detect_projection(pts, projection)
@@ -619,7 +637,15 @@ def _filter_faces(
     areas = [_area_3d(f, pid_xyz) for f in keep]
     med   = float(np.median(areas))
     if med > 0:
-        keep = [f for f, a in zip(keep, areas) if a <= _EXT_AREA_RATIO * med]
+        keep  = [f for f, a in zip(keep, areas) if a <= _EXT_AREA_RATIO * med]
+        areas = [_area_3d(f, pid_xyz) for f in keep]
+        med   = float(np.median(areas))
+        n_before = len(keep)
+        keep  = [f for f, a in zip(keep, areas) if a >= _MIN_AREA_RATIO * med]
+        if len(keep) < n_before:
+            print(f"    WARNING: removed {n_before - len(keep)} sliver face(s) "
+                  f"(area < {_MIN_AREA_RATIO:.1%} of median). "
+                  "Check that crease endpoints align with boundary nodes.")
 
     return keep
 
@@ -700,7 +726,7 @@ def _split_at_junctions(
         dist = np.linalg.norm(all_pts - foot, axis=1)     # (P,)
 
         interior_mask = (
-            (t > _SNAP_TOL) & (t < 1 - _SNAP_TOL) & (dist < _SNAP_TOL * 10)
+            (t > _TJUNC_TOL) & (t < 1 - _TJUNC_TOL) & (dist < _TJUNC_TOL * 10)
         )
         interior_idx = np.where(interior_mask)[0]
 
@@ -719,7 +745,7 @@ def _split_at_junctions(
 
 def _snap(xyz) -> tuple:
     return (
-        round(float(xyz[0]) / _SNAP_TOL) * _SNAP_TOL,
-        round(float(xyz[1]) / _SNAP_TOL) * _SNAP_TOL,
-        round(float(xyz[2]) / _SNAP_TOL) * _SNAP_TOL,
+        round(float(xyz[0]) / _NODE_MERGE_TOL) * _NODE_MERGE_TOL,
+        round(float(xyz[1]) / _NODE_MERGE_TOL) * _NODE_MERGE_TOL,
+        round(float(xyz[2]) / _NODE_MERGE_TOL) * _NODE_MERGE_TOL,
     )

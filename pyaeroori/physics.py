@@ -216,6 +216,19 @@ def add_physics(
                   Prevent radial collapse. Linearized per-node:
                   -n_x*u_x - n_y*u_y <= r0 - r_min  where n = (x,y)/r.
 
+                ``{"type": "radial_motion", "delta": float}``
+                  Enforce that XY displacement is purely radial (no tangential
+                  component). Implemented as two soft inequality constraints per
+                  node that together bound tangential displacement within ±delta.
+                  delta defaults to 1e-4 (metres). Uses a ``"nodes"`` key to
+                  restrict to a subset; otherwise applies to all membrane nodes.
+                  Example::
+
+                      lmpc=[
+                          {"type": "radial_motion", "delta": 0.05,
+                           "nodes": N.above(z=0.1)},
+                      ]
+
                 ``{"type": "custom", "nid": int, "dof": int, "coeff": float,
                    "rhs": float, "nid2": int, "dof2": int, "coeff2": float}``
                   Single or two-term custom constraint. nid2/dof2/coeff2 optional.
@@ -381,6 +394,31 @@ def add_physics(
                 cid += 1
                 count += 1
             print(f"  LMPC min_radius={r_min}: {count} constraints added")
+
+        elif ctype == "radial_motion":
+            delta = float(spec.get("delta", 1e-4))
+            target_nids = _resolve_lmpc_nodes(spec, all_nodes, surrogate)
+            count = 0
+            for nid in sorted(target_nids):
+                x, y, z = all_nodes[nid]
+                r0 = math.sqrt(x * x + y * y)
+                if r0 < 1e-12:
+                    continue
+                # Normalized tangential unit vector: t = (-y, x) / r0
+                tx = -y / r0
+                ty =  x / r0
+                # t · u ≤ delta
+                config.lmpc_rows.append(
+                    LmpcRow(cid=cid, rhs=delta, terms=[(nid, 1, tx), (nid, 2, ty)])
+                )
+                cid += 1
+                # -t · u ≤ delta
+                config.lmpc_rows.append(
+                    LmpcRow(cid=cid, rhs=delta, terms=[(nid, 1, -tx), (nid, 2, -ty)])
+                )
+                cid += 1
+                count += 1
+            print(f"  LMPC radial_motion delta={delta}: {count} nodes, {2*count} constraints added")
 
         elif ctype == "custom":
             nid   = int(spec["nid"])

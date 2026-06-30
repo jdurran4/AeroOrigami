@@ -40,9 +40,9 @@ disk_crease_file = HERE / "dgb_disk_creases.csv"
 band_crease_file = HERE / "dgb_band_creases.csv"
 
 mesh_size          = 0.22    # Target element size for Gmsh remesh (Path A, meters)
-penalty_stiffness  = 1e7
+penalty_stiffness  = 8e8
 actuator_ramp_time = 3.0
-min_radius         = 0.05
+min_radius         = 0.1
 include_cables     = True
 output_dir         = HERE / "sim_files"
 
@@ -143,6 +143,8 @@ surrogate = build_surrogate(
     all_creases,
     penalty_stiffness=penalty_stiffness,
     actuator_ramp_time=actuator_ramp_time,
+    fold_fraction=-0.99,
+    split_quads=False
     # vertex_joint_type=120,  # force spherical at all crease endpoints (research)
     # vertex_joint_type=126,  # force revolute at all crease endpoints (Path A research)
 )
@@ -174,7 +176,8 @@ config = add_physics(
     ],
     lmpc=[
         {"type": "min_z",      "z_min":  46.7, "nodes": N.above(z=46.8)},
-        {"type": "min_radius", "r_min":   0.1},
+        {"type": "min_radius", "r_min":   min_radius}, # Defaults to use all canopy nodes
+        {"type": "radial_motion", "delta": 0.05}
     ],
     cables=[
         # Use named blocks (recommended for DGB — avoids beam elements
@@ -200,14 +203,15 @@ print("=" * 50)
 sim = SimConfig(
     project_name    = "DGB_Parachute",
     sim_name        = "dgb_fold",
-    end_time        = 14.0,
-    shell_E         = 1e6,
+    end_time        = 16.0,
+    shell_E         = 1e7,
     shell_nu        = 0.4,
-    shell_rho       = 4000.0,
-    shell_t         = 1.0,
+    shell_rho       = 40000.0,
+    shell_t         = 0.2,
     cable_stiffness = 10000.0,
     a_damp          = 1e-7,
-    b_damp          = 2.0,
+    b_damp          = 5.0,
+    time_step       = 8e-5,
 )
 write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim, beta_factor=1.0)
 
