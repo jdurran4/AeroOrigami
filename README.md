@@ -6,6 +6,8 @@ Given a high-fidelity parachute FEM mesh and a crease pattern, AeroOrigami gener
 AERO-S input files needed to simulate the fold. After the simulation runs, it maps the
 folded displacements back onto the original fine mesh for use in downstream FSI simulations.
 
+Paper: https://doi-org.stanford.idm.oclc.org/10.2514/6.2026-3849
+
 ## Dependencies
 
 ```bash

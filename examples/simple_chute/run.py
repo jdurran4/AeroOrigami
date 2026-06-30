@@ -29,17 +29,12 @@ from pyaeroori.plot import (
 HERE = Path(__file__).parent
 
 # =============================================================================
-# CONFIGURATION
+# DIRECTORIES & FILES
 # =============================================================================
 
 mesh_file   = HERE / "simple_chute_mesh.fem"
 crease_file = HERE / "simple_chute_creases.csv"
-
-mesh_size          = 0.5     # Target element size for Gmsh remesh (Path A, metres)
-penalty_stiffness  = 8e9
-actuator_ramp_time = 3.0
-min_radius         = 0.05
-output_dir         = HERE / "sim_files"
+output_dir  = HERE / "sim_files"
 
 # =============================================================================
 # STEP 1 — Load the original mesh
@@ -125,8 +120,10 @@ print("=" * 50)
 surrogate = build_surrogate(
     coarse,
     creases,
-    penalty_stiffness=penalty_stiffness,
-    actuator_ramp_time=actuator_ramp_time,
+    penalty_stiffness=8e7,
+    actuator_ramp_time=5.0,
+    fold_fraction=0.95, 
+    split_quads=False
     # vertex_joint_type=120,  # force spherical at all crease endpoints (research)
     # vertex_joint_type=126,  # force revolute at all crease endpoints (Path A research)
 )
@@ -153,12 +150,12 @@ config = add_physics(
     surrogate,
     mesh=mesh,                        # required for all_bars cable detection
     disp=[
-        # Pin top-edge nodes (z≈16, x=±0.8) — fix xyz translation
-        (N.along_line((-0.8, 0, 16), (0.8, 0, 16), tol=0.05), [1, 2, 3]),
+        # Pin cable confluence point — fix xyz translation
+        (N.near(x=0.0, y=-1.6, z=0.8, tol=0.05), [1, 2, 3]),
     ],
-    lmpc=[
-        {"type": "min_z", "z_min": -1.0},
-    ],
+    # lmpc=[
+    #     {"type": "min_z", "z_min": -1.0},
+    # ],
     cables=[
         # The mesh has 4 suspension lines (type-6 beams) in the TOPOLOGY section
         # (no named blocks). all_bars detects them automatically and converts
@@ -184,12 +181,16 @@ print("=" * 50)
 sim = SimConfig(
     project_name    = "Simple_Chute",
     sim_name        = "simple_chute_fold",
-    end_time        = 1.0,
+    end_time        = 6.0,
     shell_E         = 1e7,
     shell_nu        = 0.4,
-    shell_rho       = 40000.0,
-    shell_t         = 1.0,
-    cable_stiffness = 10000.0,
+    shell_rho       = 4000.0,
+    shell_t         = 0.1,
+    cable_stiffness = 1000.0,
+    time_step       = 1e-3,
+    output_freq     = 30,
+    a_damp          = 1e-6,
+    b_damp          = 1000.0,
 )
 write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
 
