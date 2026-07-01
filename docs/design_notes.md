@@ -99,20 +99,22 @@ therefore writes `USDF.include` + `control.C` (not `FORCE.include`) when
 
 ---
 
-## Cable representation as tension-only springs (type 203)
+## Cable representation as axial springs (type 200)
 
 **Decision:** Each cable chain from the original mesh is collapsed to a single
-AERO-S type-203 tension-only spring between the chain's two endpoint nodes.
+AERO-S type-200 axial spring between the chain's two endpoint nodes.
 
-**Why:** During the fold simulation, cables need to:
-1. prevent the panels from spreading beyond the cable length, and
-2. not resist compression (cables don't push).
-
-Type 203 achieves both with a single spring stiffness parameter (`cable_stiffness`
-in `SimConfig`). Keeping the full chain of bar elements would over-constrain the
-fold by enforcing rigid intermediate node positions. The chain-collapse approach
+**Why:** Keeping the full chain of bar elements over-constrains the fold by
+enforcing rigid intermediate node positions. The chain-collapse approach
 (`_build_cable_chains` in `physics.py`) handles both linear chains and star
-topologies (N suspension lines meeting at a confluence node).
+topologies (N suspension lines meeting at a confluence node) and reduces
+hundreds of elements per cable to a single spring with one stiffness parameter
+(`cable_stiffness` in `SimConfig`).
+
+Type 200 (axial spring) replaced the earlier type-203 (tension-only spring)
+because the fold geometry can transiently put cables in compression during
+dynamic relaxation, and type-203 dropping to zero stiffness in those moments
+caused instability.
 
 ---
 
@@ -141,26 +143,52 @@ pre-run.
 
 ---
 
-## RBF interpolation for displacement mapping (Step 7 — not yet implemented)
+## Membrane interpolation for displacement mapping (Step 7)
 
-**Decision (planned):** Multiquadric RBF with 100 nearest neighbors, smoothing=1e-7.
+**Decision:** Two methods, selectable via `method=` in `map_displacements`:
 
-**Why:** The coarse origami surrogate and the fine FSI mesh have different node
-locations. Linear interpolation (Delaunay-based) fails near mesh boundaries where
-the convex hull of the coarse mesh doesn't fully contain fine mesh nodes — these
-extrapolated points return NaN. RBF handles extrapolation gracefully without
-special-casing boundary nodes. The multiquadric kernel with a small smoothing term
-gave smooth, accurate displacement fields in the prototype.
+- `"rbf"` (default) — multiquadric `RBFInterpolator`, `degree=0`, tunable
+  `rbf_neighbors` and `rbf_smoothing`.
+- `"panel_rigid"` — per-panel Procrustes/Kabsch SVD rigid-body transform with
+  nearest-centroid assignment for fine nodes.
+
+**Why `"rbf"`:** The coarse surrogate and fine FSI mesh have different node
+locations. Delaunay-based linear interpolation fails near mesh boundaries (fine
+nodes outside the coarse convex hull return NaN). RBF handles extrapolation
+gracefully. Multiquadric with `degree=0` always produces a full-rank system
+because the only polynomial augmentation is a single constant term.
+
+**Why `"panel_rigid"`:** Near the vent, many panels converge at large fold angles
+with relatively few coarse nodes. RBF treats the field as globally smooth and
+blurs displacement across crease lines. A per-panel rigid-body transform is
+physically exact for a panel that has undergone a rigid fold: each fine node is
+assigned to its nearest surrogate panel and displaced by that panel's Procrustes
+R and t. There is no cross-panel averaging.
+
+**Why not thin-plate-spline (TPS):** TPS requires polynomial augmentation to be
+full-rank. In 3D with points lying on a 2D surface (the parachute canopy), degree-3
+TPS has 20 polynomial basis functions but only 10 are linearly independent on a 2D
+manifold — the system is singular (observed error: "rank 10/20"). Use multiquadric
+(`degree=0`) or `panel_rigid` instead.
 
 ---
 
-## Cable path reconstruction (Step 7 — not yet implemented)
+## Cable path reconstruction (Step 7)
 
-**Decision (planned):** Cable node positions are NOT interpolated via RBF. Instead,
-each cable chain is reconstructed by arc-length parameterization between its two
-deformed endpoint nodes.
+**Decision:** Cable intermediate nodes are NOT interpolated via RBF or
+`panel_rigid`. Instead:
+1. Cable chain endpoint and junction nodes are seeded via nearest-coarse-node
+   KD-tree lookup (handles suspension line top/bottom nodes not shared with the
+   canopy shell mesh).
+2. Interior nodes are filled by arc-length parameterized linear interpolation
+   between the two resolved chain endpoints.
+3. Junction nodes (degree ≥ 3) are resolved as the mean of their resolved cable
+   neighbours.
 
-**Why:** Cables are 1D structures. RBF interpolation of a thin 1D cable embedded
-in a 3D displacement field produces physically unrealistic lateral deflections.
-Reconstructing along the line between deformed endpoints (which ARE known from the
-canopy interpolation) is correct for taut cables under tension.
+**Why separate treatment:** Cables are 1D structures. RBF interpolation of a thin
+cable embedded in a 3D displacement field produces physically unrealistic lateral
+deflections. Arc-length reconstruction along the deformed cable axis is correct for
+taut cables. The KD-tree anchor seeding step was added after discovering that
+suspension lines whose attachment nodes are not shared with the canopy shell mesh
+(i.e., not membrane nodes) would be left at zero without it — BFS needs both
+endpoints resolved before it can fill a chain.

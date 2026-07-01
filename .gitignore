@@ -26,5 +26,8 @@ examples/*/sim_files/
 !examples/*/sim_files/references/.gitkeep
 !examples/*/sim_files/results/.gitkeep
 
-# Data files (add paths to large mesh files here)
-# data/*.fem
+# Paraview files
+*.exo
+
+# Claude 
+CLAUDE.md

@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 _SHELL_ATTR     = 1    # all shell elements (types 15 / 1515)
 _SPH_ATTR       = 2    # all spherical joints (type 120)
 _REV_ATTR_START = 3    # revolute joints start here, one per joint (type 126)
-_CABLE_ATTR     = 10000  # cable tension-only springs (type 203)
+_CABLE_ATTR     = 10000  # cable springs (type 200)
 # NOTE: _REV_ATTR_START + len(revolute_joints) can reach thousands, so cable
 # attr must be a large fixed value that won't collide with revolute joint attrs.
 
@@ -53,7 +53,7 @@ class SimConfig:
     Tags in parentheses (e.g. ENDTIME) match the AERO-S template comments.
 
     Shell material (attribute 1, AERO-S types 15 / 1515)
-    Cable spring  (attribute 10, AERO-S type 203 — SPRINGMAT)
+    Cable spring  (attribute 10, AERO-S type 200 — SPRINGMAT)
     """
     # Identification
     project_name:    str   = "AeroOrigami"
@@ -82,7 +82,7 @@ class SimConfig:
     shell_rho:       float = 40000.0  # area mass density
     shell_t:         float = 1.0      # thickness
 
-    # Cable (type-203 tension-only spring) stiffness
+    # Cable (type-200 spring) stiffness
     cable_stiffness: float = 10000.0  # SPRINGMAT axial stiffness
 
 
@@ -92,7 +92,7 @@ def _aeros_etype(nids: list[int]) -> int:
     """Map element node count → AERO-S element type."""
     n = len(nids)
     if n == 2:
-        return 203     # tension-only spring (cable)
+        return 200     # cable spring
     if n == 3:
         return 15      # triangular AQR shell
     if n == 4:

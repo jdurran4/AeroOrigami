@@ -135,11 +135,14 @@ def remesh(
     edge_map: dict[frozenset, int] = {}
     dir_map:  dict[tuple, int]     = {}
 
+    lo = min(r.mesh_size for r in regions)
+    hi = max(r.mesh_size for r in regions)
+
     def add_pt(xyz) -> int:
         key = _snap(xyz)
         if key not in pt_map:
             pt_map[key] = gmsh.model.occ.addPoint(
-                float(xyz[0]), float(xyz[1]), float(xyz[2])
+                float(xyz[0]), float(xyz[1]), float(xyz[2]), lo
             )
         return pt_map[key]
 
@@ -169,11 +172,11 @@ def remesh(
             if name:
                 gmsh.model.setPhysicalName(2, pg, name)
 
-    lo = min(r.mesh_size for r in regions)
-    hi = max(r.mesh_size for r in regions)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", lo * 0.5)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", hi * 1.5)
-    gmsh.option.setNumber("Mesh.Algorithm", 6)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.Algorithm", 8)
 
     gmsh.model.mesh.generate(2)
 

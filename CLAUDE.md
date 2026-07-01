@@ -19,6 +19,10 @@ python examples/simple_chute/run.py
 # Convert Alexandra's raw CSVs first:
 python examples/dgb_parachute/convert_alexandra_creases.py
 python examples/dgb_parachute/run.py
+
+# After running the fold simulation on the cluster, re-run run.py to execute Step 7,
+# or iterate on mapping settings alone without re-running Steps 1-6:
+python examples/dgb_parachute/step7.py
 ```
 
 Output lands in `examples/<example>/sim_files/`. When `SimConfig` is passed to
@@ -44,7 +48,7 @@ Core dependencies: `numpy scipy matplotlib gmsh meshio`.
 | 4 | `build_surrogate` | `surrogate.py` | `Surrogate` |
 | 5 | `add_physics` | `physics.py` | `ModelConfig` |
 | 6 | `write_aeros` | `writer.py` | AERO-S files + cluster scripts on disk |
-| 7 | `map_displacements` / `write_idisp6` | `mapping.py` | **Not yet implemented** |
+| 7 | `map_displacements` / `write_idisp6` | `mapping.py` | `IDISP6.include` + optional VTK |
 
 All public exports are in `pyaeroori/__init__.py`.
 
@@ -58,7 +62,11 @@ All public exports are in `pyaeroori/__init__.py`.
   - **Path B** (`use_crease_mesh=True`): crease endpoints become mesh nodes — no Gmsh,
     guaranteed crease coverage, used by default.
   - **Path A** (`use_crease_mesh=False`): Gmsh generates mesh at target `mesh_size`,
-    saves `.msh` (gitignored). Better for curved / unstructured surfaces.
+    saves `.msh` (gitignored). Better for curved / unstructured surfaces. Key Gmsh
+    settings: per-vertex `lc` passed to `addPoint`, `CharacteristicLengthMin/Max`,
+    `CharacteristicLengthExtendFromBoundary=1` (propagates lc into panel interiors),
+    `Algorithm=8` (Delaunay). These produce ~6 elements per panel, enabling revolute
+    drivers on interior crease edges.
 
 - **`surrogate.py`**: BFS panel detection, 2-coloring, node duplication. Revolute
   joints (type 126) on interior crease nodes; spherical joints (type 120) on boundary
@@ -75,7 +83,7 @@ All public exports are in `pyaeroori/__init__.py`.
   LMPC specs accept an optional `"nodes"` key (NodeQuery) to restrict which nodes
   receive the constraint; omitting it applies to all membrane nodes. Cable chains
   detected via `_build_cable_chains` — collapses each connected chain of 2-node
-  elements to a single type-203 tension-only spring between endpoints.
+  elements to a single type-200 axial spring between endpoints.
 
 - **`writer.py`**: `write_aeros(surrogate, output_dir, config, sim, beta_factor)`.
   Always writes `ORIGAMI_MESH.include`, `ACTUATORS.include`, `EFRAMES.include`.
@@ -90,10 +98,12 @@ All public exports are in `pyaeroori/__init__.py`.
   `plot_surrogate_axes`, `plot_physics`, `mesh_stats`, `crease_stats`,
   `check_crease_coverage`, `check_mesh_crease_resolution`.
 
+- **`mapping.py`**: Step 7 implementation — see section below.
+
 ## AERO-S element types and attribute IDs
 
 Element types in TOPOLOGY: 15 (tri shell), 1515 (quad shell), 120 (spherical joint),
-126 (revolute driver), 203 (tension-only spring).
+126 (revolute driver), 200 (axial spring / cable).
 
 Attribute IDs are fixed constants in `writer.py`:
 - 1 → shell material (in `MATERIAL.include`)
@@ -112,24 +122,57 @@ time — IDs must be globally unique, which they are.
 - **USDF not FORCE for dynamic forces**: The fold simulation uses DYNAMICS / Newmark.
   Static `FORCE` is ignored in DYNAMICS runs. `config.force_bcs` → `USDF.include` +
   `control.C` (compile with `g++ -shared -fPIC control.C -o control.so`).
-- **Cable chain collapse**: Each connected chain of bars → single type-203 spring
-  between endpoints. Avoids over-constraining the fold.
+- **Cable chain collapse**: Each connected chain of bars → single type-200 axial spring
+  between endpoints. Avoids over-constraining the fold. (Previously type-203
+  tension-only; changed to type-200 to allow compression as well.)
 - **Co-located node pinning**: When a DISP BC targets a crease node, all co-located
   duplicates (same rounded coords) are also pinned automatically.
+- **TPS kernel singular matrix**: `RBFInterpolator` with `thin_plate_spline` fails on
+  surface-embedded point clouds because the polynomial augmentation matrix is rank-
+  deficient (coarse nodes lie on a 2D manifold in 3D space; degree-3 → rank 10/20).
+  Use `multiquadric` with `degree=0` (constant term, always full rank) or
+  `method="panel_rigid"` instead.
 - See `docs/design_notes.md` for fuller rationale.
 
-## Step 7 (displacement mapping) — not yet implemented
+## Step 7 (displacement mapping)
 
-`pyaeroori/mapping.py` does not exist yet. It should implement:
-1. `map_displacements(mesh, fold_mesh, disp_file, rbf_neighbors=100) → dict`
-   - Read 6-DOF xpost from AERO-S fold simulation
-   - RBF (multiquadric) from coarse surrogate to fine mesh canopy nodes
-   - Arc-length reconstruction for cable nodes
-2. `write_idisp6(displacements, output_path)` → `IDISP6.include`
+`pyaeroori/mapping.py` implements:
 
-Reference implementation in `Origami_Parachute/origami/helper.py`:
-`map_to_fine_meshRBF` and related functions. The new implementation should use
-the same RBF approach but through `pyaeroori`'s cleaner data structures.
+1. `read_xpost(disp_file, step=-1, node_ids=None)`
+   - Parses `gdisplac6.xpost` into `{nid: (dx,dy,dz,rx,ry,rz)}`
+   - Handles both AERO-S output formats automatically:
+     - 7-column rows: `node_id dx dy dz rx ry rz` (node ID explicit)
+     - 6-column rows: `dx dy dz rx ry rz` (positional; pass `node_ids=` for correct mapping)
+   - `map_displacements` passes `coarse_ids` so the 6-column format is always handled correctly
+
+2. `map_displacements(surrogate, fine_mesh, disp_file, config, step, method, ...)`
+   - **Step 3** — membrane interpolation (one of two methods):
+     - `method="rbf"` (default): multiquadric RBF from all surrogate+cable-endpoint nodes
+       → fine membrane nodes. Smooth but can blur across fold lines. Increasing
+       `rbf_neighbors` (e.g. 200–500) improves smoothness; fewer neighbors → jagged.
+     - `method="panel_rigid"`: per-panel Procrustes/Kabsch SVD rigid-body transform.
+       Best for large-angle folds near vent/high-curvature regions — no cross-panel
+       averaging. Each fine node is assigned to its nearest panel centroid (KD-tree).
+       Rotation DOFs use `scipy.spatial.transform.Rotation.from_matrix(R).as_rotvec()`.
+   - **Step 4.5** — cable anchor seeding: degree-1 (chain endpoints) and degree-≥3
+     (junction) cable-only nodes not touched by membrane interpolation are seeded via
+     nearest-coarse-node KD-tree lookup. This ensures BFS has both ends of every cable
+     chain resolved before filling interiors. Without this step, suspension lines whose
+     top/bottom nodes are not shared with the canopy shell mesh are left at zero.
+   - **Step 5** — BFS arc-length reconstruction for all interior cable nodes. Confluence
+     nodes (degree ≥ 3) resolved as mean of their resolved cable neighbours.
+   - No block-name hardcoding — works for any cable topology.
+
+3. `write_idisp6(displacements, fine_mesh, output_path, amp=1.0)` → `IDISP6.include`
+
+4. `write_folded_vtk(fine_mesh, displacements, output_path)` → VTK for ParaView
+
+### Fast iteration on Step 7 (without re-running Steps 1–6)
+
+`run.py` pickles `{surrogate, mesh, config}` to `sim_files/pipeline_state.pkl` after
+Step 6. Use `examples/dgb_parachute/step7.py` to reload the state and re-run only the
+mapping with different settings (method, rbf_neighbors, etc.). This takes ~1 s vs ~30 s
+for the full pipeline.
 
 ## Hard-coded assumptions
 

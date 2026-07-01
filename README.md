@@ -123,10 +123,12 @@ AeroOrigami/
 │   ├── surrogate.py        # Step 4: node duplication, hinge joints, actuators
 │   ├── physics.py          # Step 5: add_physics — BCs, LMPCs, cable springs
 │   ├── writer.py           # Step 6: write_aeros — AERO-S files + cluster scripts
+│   ├── mapping.py          # Step 7: map_displacements, write_idisp6, write_folded_vtk
 │   └── plot.py             # Visualization helpers
 ├── examples/
 │   ├── dgb_parachute/      # DGB parachute — full pipeline with real mesh
-│   │   ├── run.py
+│   │   ├── run.py          # Full pipeline driver (Steps 1–7)
+│   │   ├── step7.py        # Fast Step 7 iteration without re-running Steps 1–6
 │   │   ├── dgb_mesh.fem
 │   │   ├── dgb_disk_creases.csv
 │   │   ├── dgb_band_creases.csv

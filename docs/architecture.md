@@ -26,10 +26,11 @@ Original mesh (.fem) + crease CSVs
 [5] add_physics        → ModelConfig (BCs, LMPC constraints, cable springs)
 [6] write_aeros        → AERO-S include files + cluster scripts on disk
           │
-          │   (user syncs sim_files/ to cluster, runs AERO-S)
+          │   (user syncs sim_files/ to cluster, runs AERO-S fold simulation)
           │
-[7] map_displacements  → fine-mesh displacement field  (not yet implemented)
+[7] map_displacements  → fine-mesh displacement field
     write_idisp6       → IDISP6.include
+    write_folded_vtk   → folded_fine_mesh.vtk  (ParaView quality check)
 ```
 
 ---
@@ -44,6 +45,7 @@ Original mesh (.fem) + crease CSVs
 | `surrogate.py` | 4 | `build_surrogate(coarse, creases, ...) → Surrogate` |
 | `physics.py` | 5 | `add_physics(surrogate, ...) → ModelConfig`, `N` / `NodeQuery` |
 | `writer.py` | 6 | `write_aeros(surrogate, output_dir, config, sim) → dict[str, Path]`, `SimConfig` |
+| `mapping.py` | 7 | `read_xpost`, `map_displacements`, `write_idisp6`, `write_folded_vtk` |
 | `plot.py` | — | `plot_mesh`, `plot_surrogate_axes`, `plot_physics`, `mesh_stats`, … |
 
 ---
@@ -193,7 +195,7 @@ USDF
 | 1515 | 4 | Quadrilateral AQR shell (6 DOF/node) |
 | 120 | 2 | Spherical joint (unconstrained rotation) |
 | 126 | 2 | Revolute driver joint (CONMAT RAMP) |
-| 203 | 2 | Tension-only spring (cable) |
+| 200 | 2 | Axial spring (cable) |
 
 ### Attribute ID assignments (fixed in `writer.py`)
 
@@ -202,7 +204,7 @@ USDF
 | 1 | All shell elements |
 | 2 | All spherical joints |
 | 3, 4, 5, … | Revolute joints (one per joint, sequential) |
-| 10 | Cable tension-only springs |
+| 10000 | Cable axial springs (large fixed value avoids collision with revolute joint IDs) |
 
 ---
 
@@ -272,8 +274,8 @@ to all membrane nodes in the surrogate.
 
 ## Step 5: Cable detection
 
-Cable elements from the original mesh are collapsed to single tension-only
-springs (type 203) between chain endpoints. Three detection modes:
+Cable elements from the original mesh are collapsed to single axial springs
+(type 200) between chain endpoints. Three detection modes:
 
 | Spec key | Source | Use case |
 |---|---|---|
@@ -312,6 +314,58 @@ When `sim=` is provided, four cluster scripts are also written into `output_dir/
 
 Path variables (`AEROS`, `AEROSDIR`, etc.) at the top of `run.sh` and `postpro.sh`
 must be updated to match the target cluster before submitting.
+
+---
+
+## Step 7: Displacement mapping
+
+`pyaeroori/mapping.py` maps the coarse surrogate fold displacements back onto
+the original fine mesh so the FSI simulation starts from the folded configuration.
+
+### `read_xpost(disp_file, step=-1, node_ids=None)`
+
+Parses `gdisplac6.xpost` into `{nid: (dx, dy, dz, rx, ry, rz)}`. Handles two
+AERO-S output formats detected automatically from the first data row:
+- **7-column**: `node_id dx dy dz rx ry rz` — node ID explicit
+- **6-column**: `dx dy dz rx ry rz` — positional (no ID); `map_displacements`
+  passes `coarse_ids` so the i-th row maps to the i-th coarse node in order
+
+### `map_displacements(surrogate, fine_mesh, disp_file, config, method, ...)`
+
+Four internal stages:
+
+1. **Membrane interpolation** (method-dependent):
+   - `method="rbf"` — multiquadric `RBFInterpolator` from all surrogate +
+     cable-endpoint nodes to all fine membrane nodes. Smooth and global but can
+     blur across fold lines near high-curvature regions. More `rbf_neighbors`
+     (200–500) improves smoothness.
+   - `method="panel_rigid"` — per-panel Procrustes/Kabsch SVD rigid-body
+     transform. For each surrogate panel, fits the best-fit R and t from
+     undeformed to deformed node positions. Each fine node is assigned to its
+     nearest panel centroid (KD-tree). Rotation DOFs use
+     `scipy.spatial.transform.Rotation.from_matrix(R).as_rotvec()`. Best for
+     large-angle folds near the vent where RBF blurs across crease lines.
+
+2. **DISP BC seeding** — any nodes named in `config.disp_bcs` are seeded with
+   zero displacement (they're pinned in the fold simulation).
+
+3. **Cable anchor seeding** — degree-1 (chain endpoints) and degree-≥3
+   (junction) cable-only nodes not covered by membrane interpolation are seeded
+   via nearest-coarse-node KD-tree lookup. This ensures both ends of every
+   cable chain are resolved before BFS runs. Without this, suspension lines
+   whose attachment nodes are not shared with the canopy shell mesh would be
+   left at zero.
+
+4. **BFS arc-length fill** — interior cable nodes are filled by arc-length
+   parameterized interpolation between the two resolved chain endpoints.
+   Junction nodes (degree ≥ 3) are resolved as the mean of their resolved
+   cable neighbours.
+
+### Fast iteration on Step 7
+
+`run.py` pickles `{surrogate, mesh, config}` to `sim_files/pipeline_state.pkl`
+after Step 6. `examples/dgb_parachute/step7.py` reloads that state and re-runs
+only the mapping with different settings (~1 s vs ~30 s for the full pipeline).
 
 ---
 

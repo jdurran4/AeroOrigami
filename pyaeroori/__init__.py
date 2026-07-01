@@ -6,5 +6,4 @@ from .writer import write_aeros, SimConfig
 from .physics import add_physics, N, ModelConfig
 from . import plot
 
-# Step 7 (displacement mapping) — not yet implemented:
-# from .mapping import map_displacements, write_idisp6
+from .mapping import map_displacements, write_idisp6, read_xpost, write_folded_vtk
