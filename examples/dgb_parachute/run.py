@@ -60,9 +60,13 @@ band_crease_file = HERE / "dgb_band_creases.csv"
 mesh_size          = 0.35    # Target element size for Gmsh remesh (Path A, meters)
 penalty_stiffness  = 8e8
 actuator_ramp_time = 3.0
+end_time           = 11.0
 min_radius         = 0.1
 include_cables     = True
 output_dir         = HERE / "sim_files"
+
+parallel           = True    # run.sh: mpirun with a `--dec` domain decomposition, vs. serial
+nsub               = 10      # number of subdomains (only used when parallel=True)
 
 # =============================================================================
 # STEP 1 — Load the original mesh
@@ -191,6 +195,9 @@ config = add_physics(
         (N.near(x=-0.146,y=-0.253,z=-0.738,tol=0.1), [1, 2, 3, 4, 5, 6]),
         (N.near(x=0.292,y=0.0,z=-0.738,tol=0.05), [1, 2, 3, 4, 5, 6]),
         (N.near(x=-0.146,y=0.253,z=-0.738,tol=0.05), [1, 2, 3, 4, 5, 6]),
+        # Pin riser to keep it straight
+        (N.near(x=0.0,y=0.0,z=8.314,tol=0.05), [1, 2, 3, 4, 5, 6]),
+        (N.near(x=0.0,y=0.0,z=0.5285,tol=0.05), [1, 2, 3, 4, 5, 6]),
     ],
     lmpc=[
         {"type": "min_z",      "z_min":  46.7, "nodes": N.above(z=46.8)},
@@ -206,7 +213,7 @@ config = add_physics(
         # {"block": "Suspension_Lines"},
     ],
 )
-# plot_physics(surrogate, config, title="DGB Parachute — Physics Overview (Step 5)", arrow_length=0.1)
+plot_physics(surrogate, config, title="DGB Parachute — Physics Overview (Step 5)", arrow_length=0.1)
 
 # =============================================================================
 # STEP 6 — Write AEROS files
@@ -221,15 +228,17 @@ print("=" * 50)
 sim = SimConfig(
     project_name    = "DGB_Parachute",
     sim_name        = "dgb_fold",
-    end_time        = 16.0,
+    end_time        = end_time,
     shell_E         = 1e7,
     shell_nu        = 0.4,
     shell_rho       = 40000.0,
-    shell_t         = 0.2,
+    shell_t         = 1.0,
     cable_stiffness = 10000.0,
     a_damp          = 1e-7,
-    b_damp          = 5.0,
-    time_step       = 8e-5,
+    b_damp          = 3.0,
+    time_step       = 2e-4,
+    parallel        = parallel,
+    nsub            = nsub,
 )
 write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim, beta_factor=1.0)
 
@@ -260,45 +269,45 @@ print(f"  To iterate on Step 7 without re-running Steps 1–6, use: python examp
 # examples/dgb_parachute/step7.py and run that instead (~1 s vs ~30 s here).
 # =============================================================================
 
-disp_file  = output_dir / "gdisplac6.xpost"
-idisp_file = output_dir / "IDISP6.include"
-vtk_file   = output_dir / "folded_fine_mesh.vtk"
+# disp_file  = output_dir / "gdisplac6.xpost"
+# idisp_file = output_dir / "IDISP6.include"
+# vtk_file   = output_dir / "folded_fine_mesh.vtk"
 
-if disp_file.exists():
-    print()
-    print("=" * 50)
-    print("STEP 7 — Displacement mapping")
-    print("=" * 50)
+# if disp_file.exists():
+#     print()
+#     print("=" * 50)
+#     print("STEP 7 — Displacement mapping")
+#     print("=" * 50)
 
-    # Two mapping methods available — swap method= to compare:
-    #
-    #   "rbf"         Multiquadric RBF across all coarse nodes. Smooth and
-    #                 global, but can blur across fold lines near the vent
-    #                 where many panels converge. More rbf_neighbors = smoother.
-    #
-    #   "panel_rigid" Per-panel Procrustes rigid-body transform (Kabsch SVD).
-    #                 Correct for large-angle folds; no cross-panel averaging.
-    #                 Best near the vent / high-curvature regions.
-    #
-    # Cable intermediate nodes are always reconstructed via BFS arc-length
-    # interpolation regardless of method.
-    displacements = map_displacements(
-        surrogate,
-        mesh,
-        disp_file,
-        config=config,             # carries cable endpoint nodes
-        step=-1,                   # use last time step in xpost
-        method="rbf",
-        rbf_neighbors=50,          # only used by method="rbf"
-        rbf_smoothing=1e-6,
-    )
+#     # Two mapping methods available — swap method= to compare:
+#     #
+#     #   "rbf"         Multiquadric RBF across all coarse nodes. Smooth and
+#     #                 global, but can blur across fold lines near the vent
+#     #                 where many panels converge. More rbf_neighbors = smoother.
+#     #
+#     #   "panel_rigid" Per-panel Procrustes rigid-body transform (Kabsch SVD).
+#     #                 Correct for large-angle folds; no cross-panel averaging.
+#     #                 Best near the vent / high-curvature regions.
+#     #
+#     # Cable intermediate nodes are always reconstructed via BFS arc-length
+#     # interpolation regardless of method.
+#     displacements = map_displacements(
+#         surrogate,
+#         mesh,
+#         disp_file,
+#         config=config,             # carries cable endpoint nodes
+#         step=-1,                   # use last time step in xpost
+#         method="rbf",
+#         rbf_neighbors=50,          # only used by method="rbf"
+#         rbf_smoothing=1e-6,
+#     )
 
-    write_idisp6(displacements, mesh, idisp_file)
-    write_folded_vtk(mesh, displacements, vtk_file)
-    print("  Open folded_fine_mesh.vtk in ParaView to visually verify the mapping.")
-    print("  Displacement vectors are stored as VECTORS 'displacement' on each node.")
-else:
-    print()
-    print(f"Step 7 skipped — {disp_file} not found.")
-    print("  Run the fold simulation on the cluster, copy gdisplac6.xpost to sim_files/,")
-    print("  then re-run this script.")
+#     write_idisp6(displacements, mesh, idisp_file)
+#     write_folded_vtk(mesh, displacements, vtk_file)
+#     print("  Open folded_fine_mesh.vtk in ParaView to visually verify the mapping.")
+#     print("  Displacement vectors are stored as VECTORS 'displacement' on each node.")
+# else:
+#     print()
+#     print(f"Step 7 skipped — {disp_file} not found.")
+#     print("  Run the fold simulation on the cluster, copy gdisplac6.xpost to sim_files/,")
+#     print("  then re-run this script.")

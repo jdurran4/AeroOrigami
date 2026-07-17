@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 
 _COORD_DIGITS = 4
 _CABLE_ATTR   = 10   # attribute ID for cable bar elements in mesh_modified.include
+_DEFAULT_ANCHOR_THRESHOLD = 0.3  # metres — see _find_or_add_node
+# Lowered from 1.0 after a real collision: a vent-hole hub 0.7525 m (the
+# vent radius) from the nearest structural node was misclassified as "should
+# snap to nearby structure" instead of "genuine new anchor point deliberately
+# outside the mesh" — and that nearest node was ALSO the exact legitimate
+# match for one of the hub's own cable endpoints, producing a zero-length
+# spring that made the solver report structurally singular. Per-block
+# overrides (via "anchor_threshold" in a cable spec) still exist for
+# clarity/documentation even where they're now redundant with this default.
 
 
 # ── NodeQuery ─────────────────────────────────────────────────────────────────
@@ -268,6 +277,16 @@ def add_physics(
                   nearest the last point. Intermediate points are ignored.
                   tol defaults to 1e-3.
 
+                All forms also accept ``"anchor_threshold": float`` (default
+                0.3 m). Endpoint resolution: <= tol is a clean match; beyond
+                tol but <= anchor_threshold snaps to the nearest node anyway
+                with a loud warning (the crease pattern likely has a gap —
+                e.g. a coarsened seam skipped this attachment point) rather
+                than silently creating a node with no shell element attached
+                to it; beyond anchor_threshold is treated as a genuine new
+                anchor point (e.g. a payload/riser convergence point off the
+                canopy, later pinned via a DISP entry) and gets a new node.
+
     Returns
     -------
     ModelConfig
@@ -290,13 +309,14 @@ def add_physics(
 
     for spec in cables:
         tol = float(spec.get("tol", 1e-3))
+        anchor_threshold = float(spec.get("anchor_threshold", _DEFAULT_ANCHOR_THRESHOLD))
 
         if "block" in spec:
             if mesh is None:
                 print(f"  WARNING: cable block='{spec['block']}' requires mesh= parameter — skipped")
                 continue
             _add_cable_chains_from_elems(
-                spec["block"], mesh, surrogate, config, next_nid, next_eid, tol
+                spec["block"], mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
             )
 
         elif "blocks" in spec:
@@ -305,7 +325,7 @@ def add_physics(
                 continue
             for bname in spec["blocks"]:
                 _add_cable_chains_from_elems(
-                    bname, mesh, surrogate, config, next_nid, next_eid, tol
+                    bname, mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
                 )
 
         elif spec.get("all_bars"):
@@ -313,13 +333,13 @@ def add_physics(
                 print("  WARNING: all_bars=True requires mesh= parameter — skipped")
                 continue
             _add_all_cable_chains(
-                mesh, surrogate, config, next_nid, next_eid, tol
+                mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
             )
 
         elif "points" in spec:
             pts   = [tuple(float(v) for v in p) for p in spec["points"]]
             label = spec.get("label", "explicit")
-            _add_cable_from_points(pts, tol, label, surrogate, config, next_nid, next_eid)
+            _add_cable_from_points(pts, tol, label, surrogate, config, next_nid, next_eid, anchor_threshold)
 
         else:
             print(f"  WARNING: cable entry missing 'block', 'blocks', 'all_bars', or 'points' — skipped: {spec}")
@@ -492,21 +512,50 @@ def _membrane_nids(surrogate: "Surrogate") -> set[int]:
 
 
 def _find_or_add_node(
-    pt:          tuple,
-    surr_nodes:  dict,
-    cable_nodes: dict,
-    next_nid:    list,   # [int] — mutable counter
-    tol:         float,
-    label:       str,
+    pt:               tuple,
+    surr_nodes:       dict,
+    cable_nodes:      dict,
+    next_nid:         list,   # [int] — mutable counter
+    tol:              float,
+    label:            str,
+    anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
 ) -> int:
-    """Return ID of nearest node within tol (surrogate or new cable), or add a new one."""
+    """
+    Resolve a cable endpoint to a node.
+
+    Reuse of an already-added cable anchor node is exact/tol-only — never
+    fuzzy-matched against anchor_threshold — because two DISTINCT intended
+    anchor points (e.g. two adjacent bridle attachments) can legitimately
+    sit within anchor_threshold of EACH OTHER while still needing their own
+    separate nodes; anchor_threshold fuzzy-matching is only for snapping to
+    real structure (surr_nodes), where "close" plausibly means "this is the
+    node the pattern should have placed here."
+
+    Distance to the nearest real structural node then decides:
+      <= tol               : clean match, use it.
+      tol < d <= anchor_threshold : the pattern should have had a node here
+                              (e.g. a coarsened crease pattern skipped this
+                              gore) — snap to the nearest node anyway and
+                              warn loudly, rather than silently creating a
+                              disconnected node with no shell attached to it.
+      > anchor_threshold    : nothing is remotely close — this is a genuine
+                              fresh anchor point (e.g. a payload/riser
+                              convergence point off the canopy surface,
+                              later pinned via a DISP entry), so add a new
+                              node as before.
+    """
     ref = np.array(pt, dtype=float)
+
+    best_cable_nid, best_cable_dist = None, float("inf")
+    for nid, xyz in cable_nodes.items():
+        d = float(np.linalg.norm(np.array(xyz) - ref))
+        if d < best_cable_dist:
+            best_cable_dist, best_cable_nid = d, nid
+    if best_cable_dist <= tol:
+        return best_cable_nid
+
     best_nid, best_dist = None, float("inf")
     for nid, xyz in surr_nodes.items():
-        d = float(np.linalg.norm(np.array(xyz) - ref))
-        if d < best_dist:
-            best_dist, best_nid = d, nid
-    for nid, xyz in cable_nodes.items():
         d = float(np.linalg.norm(np.array(xyz) - ref))
         if d < best_dist:
             best_dist, best_nid = d, nid
@@ -514,7 +563,14 @@ def _find_or_add_node(
     if best_dist <= tol:
         return best_nid
 
-    # No close node — add a new one
+    if best_dist <= anchor_threshold:
+        print(f"  WARNING [{label}]: cable endpoint ({pt[0]:.4f}, {pt[1]:.4f}, {pt[2]:.4f}) "
+              f"snapped to node {best_nid}, {best_dist:.4f} m away — farther than "
+              f"tol={tol:.4f}. The crease pattern likely has no node at the intended "
+              f"point; check coarsening/every_nth settings if this is unexpected.")
+        return best_nid
+
+    # Nothing remotely close — a genuine new anchor point
     nid = next_nid[0]
     next_nid[0] += 1
     cable_nodes[nid] = (float(pt[0]), float(pt[1]), float(pt[2]))
@@ -591,13 +647,14 @@ def _counters(config: ModelConfig, nid0: int, eid0: int):
 
 
 def _add_cable_chains_from_elems(
-    block_name:  str,
-    mesh:        "Mesh",
-    surrogate:   "Surrogate",
-    config:      ModelConfig,
-    next_nid:    int,
-    next_eid:    int,
-    tol:         float = 1e-3,
+    block_name:       str,
+    mesh:             "Mesh",
+    surrogate:        "Surrogate",
+    config:           ModelConfig,
+    next_nid:         int,
+    next_eid:         int,
+    tol:              float = 1e-3,
+    anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
 ) -> None:
     """Map a named mesh block's 2-node elements to surrogate as chain-end springs."""
     block_eids = mesh.blocks.get(block_name)
@@ -617,8 +674,8 @@ def _add_cable_chains_from_elems(
     _nid, _eid = _counters(config, next_nid, next_eid)
     n_added = 0
     for na, nb in _build_cable_chains(pairs):
-        sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, block_name)
-        sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, block_name)
+        sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, block_name, anchor_threshold)
+        sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, block_name, anchor_threshold)
         config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
         _eid[0] += 1
         n_added += 1
@@ -627,12 +684,13 @@ def _add_cable_chains_from_elems(
 
 
 def _add_all_cable_chains(
-    mesh:        "Mesh",
-    surrogate:   "Surrogate",
-    config:      ModelConfig,
-    next_nid:    int,
-    next_eid:    int,
-    tol:         float = 1e-3,
+    mesh:             "Mesh",
+    surrogate:        "Surrogate",
+    config:           ModelConfig,
+    next_nid:         int,
+    next_eid:         int,
+    tol:              float = 1e-3,
+    anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
 ) -> None:
     """Map ALL 2-node elements in the mesh to surrogate as chain-end springs."""
     cable_elems = mesh.cable_elements
@@ -646,8 +704,8 @@ def _add_all_cable_chains(
     _nid, _eid = _counters(config, next_nid, next_eid)
     n_added = 0
     for na, nb in chains:
-        sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars")
-        sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars")
+        sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars", anchor_threshold)
+        sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars", anchor_threshold)
         config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
         _eid[0] += 1
         n_added += 1
@@ -656,13 +714,14 @@ def _add_all_cable_chains(
 
 
 def _add_cable_from_points(
-    pts:         list[tuple],
-    tol:         float,
-    label:       str,
-    surrogate:   "Surrogate",
-    config:      ModelConfig,
-    next_nid:    int,
-    next_eid:    int,
+    pts:              list[tuple],
+    tol:              float,
+    label:            str,
+    surrogate:        "Surrogate",
+    config:           ModelConfig,
+    next_nid:         int,
+    next_eid:         int,
+    anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
 ) -> None:
     """Create ONE tension-only spring between the first and last point in the list."""
     if len(pts) < 2:
@@ -670,8 +729,8 @@ def _add_cable_from_points(
         return
 
     _nid, _eid = _counters(config, next_nid, next_eid)
-    sid_a = _find_or_add_node(pts[0],  surrogate.nodes, config.cable_nodes, _nid, tol, label)
-    sid_b = _find_or_add_node(pts[-1], surrogate.nodes, config.cable_nodes, _nid, tol, label)
+    sid_a = _find_or_add_node(pts[0],  surrogate.nodes, config.cable_nodes, _nid, tol, label, anchor_threshold)
+    sid_b = _find_or_add_node(pts[-1], surrogate.nodes, config.cable_nodes, _nid, tol, label, anchor_threshold)
     config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
 
     print(f"  Cable '{label}': 1 spring  node {sid_a} → node {sid_b}"

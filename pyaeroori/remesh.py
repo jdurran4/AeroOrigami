@@ -61,18 +61,34 @@ class Region:
 
     Parameters
     ----------
-    creases         : fold lines and boundary edges for this region
-    mesh_size       : target Gmsh element edge length (metres) — Path A only
-    projection      : '\'auto\'' | '\'planar\'' | '\'cylindrical\'' | '\'tangent\''
-    name            : label for Gmsh Physical Group / AEROS output
-    use_crease_mesh : True → Path B (crease polygons as shell elements, no Gmsh)
+    creases            : fold lines and boundary edges for this region
+    mesh_size          : target Gmsh element edge length (metres) — Path A only
+    projection         : '\'auto\'' | '\'planar\'' | '\'cylindrical\'' | '\'tangent\''
+    name               : label for Gmsh Physical Group / AEROS output
+    use_crease_mesh    : True → Path B (crease polygons as shell elements, no Gmsh)
+    add_edge_midpoints : Path A only. Bisect every panel-boundary crease
+                         (mountain/valley) edge that isn't already split (by
+                         a T-junction or a pre-split CSV row, e.g. for a
+                         cable attachment) with an extra point, guaranteeing
+                         at least one interior node — and so a joint site —
+                         per crease edge regardless of mesh_size.
+                         Deterministic: a curve endpoint is always meshed,
+                         unlike interior subdivision, which mesh_size only
+                         requests. Boundary-only edges (rim, vent) are never
+                         bisected — they don't get joints, so splitting them
+                         would just add skewed sliver elements for no benefit
+                         (this matters for loops like a vent circle, whose
+                         discretization rarely lines up 1:1 with panel width,
+                         so a panel's boundary side is often already 2+ raw
+                         segments).
     """
-    creases:         CreasePattern
-    mesh_size:       float = 0.2
-    projection:      str   = "auto"
-    name:            str   = ""
-    use_crease_mesh: bool  = False
-    outward_normal:  tuple | None = None  # hint for build_surrogate panel-normal orientation
+    creases:            CreasePattern
+    mesh_size:          float = 0.2
+    projection:         str   = "auto"
+    name:               str   = ""
+    use_crease_mesh:    bool  = False
+    add_edge_midpoints: bool  = False
+    outward_normal:     tuple | None = None  # hint for build_surrogate panel-normal orientation
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,11 +154,13 @@ def remesh(
     lo = min(r.mesh_size for r in regions)
     hi = max(r.mesh_size for r in regions)
 
-    def add_pt(xyz) -> int:
+    def add_pt(xyz, mesh_size: float = lo) -> int:
+        # Points shared between regions (stitched boundary nodes) keep
+        # whichever region's mesh_size requested them first.
         key = _snap(xyz)
         if key not in pt_map:
             pt_map[key] = gmsh.model.occ.addPoint(
-                float(xyz[0]), float(xyz[1]), float(xyz[2]), lo
+                float(xyz[0]), float(xyz[1]), float(xyz[2]), mesh_size
             )
         return pt_map[key]
 
@@ -197,9 +215,10 @@ def remesh(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _find_panels(
-    segs:       list[tuple[np.ndarray, np.ndarray]],
-    projection: str,
-) -> tuple[list[list[int]], dict[int, np.ndarray], dict[int, tuple], str]:
+    segs:        list[tuple[np.ndarray, np.ndarray]],
+    projection:  str,
+    is_boundary: list[bool] | None = None,
+) -> tuple[list[list[int]], dict[int, np.ndarray], dict[int, tuple], str, dict[frozenset, bool]]:
     """
     Shared by both paths.  From a flat list of 3D segments:
 
@@ -207,22 +226,40 @@ def _find_panels(
       2. Snap-and-dedup endpoints into local pids (1-based integers).
       3. Detect projection; build 2D coords and angle function.
       4. Half-edge traversal → raw face polygons.
-      5. Filter exterior / degenerate faces.
+      5. Filter exterior / degenerate / hole faces.
+
+    Parameters
+    ----------
+    is_boundary : parallel to segs — True for boundary-loop segments, False
+                  for mountain/valley crease segments. Used to detect and
+                  discard "hole" faces (e.g. a vent opening) whose entire
+                  perimeter is boundary edges with no fold line — these are
+                  not actuatable panels even though they pass the area-ratio
+                  outlier filter. Pass None to skip hole detection.
 
     Returns
     -------
-    interior  : list of face polygons (each a list of local pids)
-    pid_xyz   : local pid → 3D numpy array
-    coords2d  : local pid → 2D (u, v) tuple
-    proj      : projection string actually used
+    interior        : list of face polygons (each a list of local pids)
+    pid_xyz         : local pid → 3D numpy array
+    coords2d        : local pid → 2D (u, v) tuple
+    proj            : projection string actually used
+    edge_has_crease : (local pid, local pid) frozenset → True if that mesh
+                       edge is a mountain/valley crease (not boundary-only).
+                       Path A's add_edge_midpoints uses this to only bisect
+                       fold edges — boundary edges (rim, vent) never get a
+                       joint, so splitting them is pure waste.
     """
-    segs = _split_at_junctions(segs)
+    segs, is_boundary = _split_at_junctions(segs, is_boundary)
 
     snap_local: dict[tuple, int]      = {}
     pid_xyz:    dict[int, np.ndarray] = {}
     adj:        dict[int, set]        = defaultdict(set)
+    edge_has_crease: dict[frozenset, bool] = {}
 
-    for p1, p2 in segs:
+    if is_boundary is None:
+        is_boundary = [False] * len(segs)
+
+    for (p1, p2), boundary in zip(segs, is_boundary):
         k1, k2 = _snap(p1), _snap(p2)
         for k, p in ((k1, p1), (k2, p2)):
             if k not in snap_local:
@@ -233,9 +270,11 @@ def _find_panels(
         if a != b:
             adj[a].add(b)
             adj[b].add(a)
+            edge = frozenset((a, b))
+            edge_has_crease[edge] = edge_has_crease.get(edge, False) or not boundary
 
     if len(pid_xyz) < 3:
-        return [], pid_xyz, {}, projection
+        return [], pid_xyz, {}, projection, edge_has_crease
 
     # Diagnostic: flag edges that are suspiciously short relative to the median.
     # These usually mean a crease endpoint didn't snap to its intended boundary node.
@@ -291,10 +330,10 @@ def _find_panels(
             if len(face) >= 3:
                 raw_faces.append(face)
 
-    interior = _filter_faces(raw_faces, coords2d, pid_xyz, proj)
+    interior = _filter_faces(raw_faces, coords2d, pid_xyz, proj, edge_has_crease)
     print(f"    {len(raw_faces)} raw faces → {len(interior)} interior panels")
 
-    return interior, pid_xyz, coords2d, proj
+    return interior, pid_xyz, coords2d, proj, edge_has_crease
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,15 +352,18 @@ def _build_region(
 
     cp   = region.creases
     segs: list[tuple[np.ndarray, np.ndarray]] = []
+    is_boundary: list[bool] = []
     for p1, p2, *_ in cp.mountain + cp.valley:
         segs.append((np.asarray(p1, float), np.asarray(p2, float)))
+        is_boundary.append(False)
     for p1, p2 in cp.boundary:
         segs.append((np.asarray(p1, float), np.asarray(p2, float)))
+        is_boundary.append(True)
 
     if not segs:
         return []
 
-    interior, pid_xyz, _, _ = _find_panels(segs, region.projection)
+    interior, pid_xyz, _, _, edge_has_crease = _find_panels(segs, region.projection, is_boundary)
 
     if not interior:
         print(f"    WARNING: no interior faces found for region '{region.name}'")
@@ -331,14 +373,28 @@ def _build_region(
     for face in interior:
         n = len(face)
         # Translate local pids → Gmsh point tags, then build curve loop
-        gtags = [add_pt(pid_xyz[lid]) for lid in face]
+        gtags = [add_pt(pid_xyz[lid], region.mesh_size) for lid in face]
         lines, ok = [], True
         for i in range(n):
             a, b = gtags[i], gtags[(i + 1) % n]
             if a == b:
                 ok = False
                 break
-            lines.append(add_line(a, b))
+            is_crease = edge_has_crease.get(frozenset((face[i], face[(i + 1) % n])), False)
+            if region.add_edge_midpoints and is_crease:
+                # This edge is a single unsplit crease segment here (any edge
+                # that already had a T-junction or pre-split CSV point would
+                # already appear as 2+ consecutive face entries, not one) —
+                # bisect it so it's guaranteed an interior mesh node.
+                # Boundary edges (rim, vent) never get a joint, so they're
+                # skipped — bisecting them would just be wasted, skewed
+                # sliver elements for no benefit.
+                mid_xyz = (pid_xyz[face[i]] + pid_xyz[face[(i + 1) % n]]) / 2
+                mid = add_pt(mid_xyz, region.mesh_size)
+                lines.append(add_line(a, mid))
+                lines.append(add_line(mid, b))
+            else:
+                lines.append(add_line(a, b))
         if not ok or len(lines) < 3:
             continue
         try:
@@ -392,15 +448,18 @@ def _crease_path(regions: list[Region]) -> Mesh:
     for region in regions:
         cp   = region.creases
         segs: list[tuple[np.ndarray, np.ndarray]] = []
+        is_boundary: list[bool] = []
         for p1, p2, *_ in cp.mountain + cp.valley:
             segs.append((np.asarray(p1, float), np.asarray(p2, float)))
+            is_boundary.append(False)
         for p1, p2 in cp.boundary:
             segs.append((np.asarray(p1, float), np.asarray(p2, float)))
+            is_boundary.append(True)
 
         if not segs:
             continue
 
-        interior, pid_xyz, _, _ = _find_panels(segs, region.projection)
+        interior, pid_xyz, _, _, _ = _find_panels(segs, region.projection, is_boundary)
 
         n_before = panel_id - 1
         for face in interior:
@@ -607,10 +666,11 @@ def _area_3d(face: list[int], pid_xyz: dict) -> float:
 
 
 def _filter_faces(
-    faces:    list[list[int]],
-    coords2d: dict,
-    pid_xyz:  dict,
-    proj:     str,
+    faces:           list[list[int]],
+    coords2d:        dict,
+    pid_xyz:         dict,
+    proj:            str,
+    edge_has_crease: dict[frozenset, bool] | None = None,
 ) -> list[list[int]]:
     """
     Retain only interior (panel) faces.
@@ -618,7 +678,11 @@ def _filter_faces(
     1. Discard degenerate faces (< 3 distinct vertices).
     2. Discard faces with non-positive signed 2D area (exterior / CW).
     3. For cylindrical projections, discard cap faces (constant height).
-    4. Discard faces whose 3D area > _EXT_AREA_RATIO × median (residual exterior).
+    4. Discard "hole" faces whose entire perimeter is boundary edges with no
+       fold line (e.g. a vent opening) — not an actuatable panel even though
+       it can pass the area-ratio outlier filter below. Skipped if the
+       region has no crease edges at all (a legitimately fold-free region).
+    5. Discard faces whose 3D area > _EXT_AREA_RATIO × median (residual exterior).
     """
     keep: list[list[int]] = []
 
@@ -636,6 +700,19 @@ def _filter_faces(
 
     if not keep:
         return keep
+
+    if edge_has_crease and any(edge_has_crease.values()):
+        n_before = len(keep)
+        keep = [
+            f for f in keep
+            if any(
+                edge_has_crease.get(frozenset((f[i], f[(i + 1) % len(f)])), False)
+                for i in range(len(f))
+            )
+        ]
+        if len(keep) < n_before:
+            print(f"    Discarded {n_before - len(keep)} hole face(s) with no "
+                  "fold-line edges (e.g. a vent opening).")
 
     areas = [_area_3d(f, pid_xyz) for f in keep]
     med   = float(np.median(areas))
@@ -700,24 +777,32 @@ def _gmsh_to_mesh(panel_surf_map: dict[int, int]) -> Mesh:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _split_at_junctions(
-    segs: list[tuple[np.ndarray, np.ndarray]],
-) -> list[tuple[np.ndarray, np.ndarray]]:
+    segs:        list[tuple[np.ndarray, np.ndarray]],
+    is_boundary: list[bool] | None = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[bool] | None]:
     """
     Detect T-junctions and split the through-segment at each one.
 
     A T-junction exists when an endpoint of one segment lies in the strict
     interior of another.  Without splitting the crease graph has a dangling
     node that the half-edge traversal cannot handle correctly.
+
+    is_boundary, if given, is parallel to segs — each split sub-segment
+    inherits its parent's flag. Returned parallel to the split result (or
+    None if not given).
     """
+    tags = is_boundary if is_boundary is not None else [None] * len(segs)
+
     snap_to_xyz: dict[tuple, np.ndarray] = {}
     for p1, p2 in segs:
         snap_to_xyz.setdefault(_snap(p1), p1.copy())
         snap_to_xyz.setdefault(_snap(p2), p2.copy())
 
     all_pts = np.array(list(snap_to_xyz.values()))   # (P, 3)
-    result:  list[tuple[np.ndarray, np.ndarray]] = []
+    result:      list[tuple[np.ndarray, np.ndarray]] = []
+    result_tags: list = []
 
-    for p1, p2 in segs:
+    for (p1, p2), tag in zip(segs, tags):
         v        = p2 - p1
         seg_len2 = float(np.dot(v, v))
         if seg_len2 < 1e-24:
@@ -735,6 +820,7 @@ def _split_at_junctions(
 
         if len(interior_idx) == 0:
             result.append((p1.copy(), p2.copy()))
+            result_tags.append(tag)
             continue
 
         t_interior = t[interior_idx]
@@ -742,8 +828,9 @@ def _split_at_junctions(
         chain      = [p1] + [all_pts[interior_idx[i]] for i in order] + [p2]
         for i in range(len(chain) - 1):
             result.append((chain[i].copy(), chain[i + 1].copy()))
+            result_tags.append(tag)
 
-    return result
+    return result, (result_tags if is_boundary is not None else None)
 
 
 def _snap(xyz) -> tuple:

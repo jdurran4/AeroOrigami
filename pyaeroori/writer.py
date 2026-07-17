@@ -69,7 +69,8 @@ class SimConfig:
     b_damp:       float = 2.0      # BDAMP (mass proportional)
 
     # Solver / constraints
-    solver:          str   = "sparse" # SOLVERNAME
+    # STATICS solver is derived from `parallel`, not set here: "mumps pivot"
+    # for parallel (--dec + mpirun) runs, "sparse" for serial.
     lmpc_penalty:    float = 1e8      # LMPCPENALTYSTRENGTH
 
     # Output / restart frequency (every N time steps)
@@ -84,6 +85,10 @@ class SimConfig:
 
     # Cable (type-200 spring) stiffness
     cable_stiffness: float = 10000.0  # SPRINGMAT axial stiffness
+
+    # Cluster execution
+    parallel:        bool  = False    # run via `--dec` + mpirun instead of serial
+    nsub:            int   = 10       # number of subdomains (mpirun -np, --nsub)
 
 
 # ── AERO-S element type mapping ───────────────────────────────────────────────
@@ -494,7 +499,7 @@ def _write_input_file(
     L(f"RAYDAMP {sim.a_damp:.6e} {sim.b_damp:.6e}")
     L(sep)
     L("STATICS")
-    L(f"{sim.solver}")
+    L("mumps pivot" if sim.parallel else "sparse")
     L(sep)
     L("CONSTRAINTS")
     L(f"penalty {sim.lmpc_penalty:.6e}")
@@ -543,7 +548,7 @@ def _write_eframes(rev_joints: list["JointInfo"], path: Path) -> None:
 
 # ── Cluster script templates ───────────────────────────────────────────────────
 
-_RUN_SH = """\
+_RUN_SH_HEADER = """\
 #!/bin/bash
 # ── Paths — update to match your cluster installation ────────────────────────
 AEROS=/home/rtezaur/codes/aero-s/build/bin/aeros
@@ -568,7 +573,16 @@ if [ -f control.C ]; then
     g++ -shared control.o -o control.so
 fi
 
+"""
+
+_RUN_SH_SERIAL = """\
 $AEROS -q fold.fem |& tee log.out
+"""
+
+_RUN_SH_PARALLEL = """\
+module load openmpi/3.0.0-gcc-7.1.0
+$AEROS --dec --nsub {nsub} --use-scotch --exit -v 1 fold.fem
+mpirun -np {nsub} $AEROS -d {sim_name}.optDec -q fold.fem |& tee log.out
 """
 
 _RUN_SBATCH = """\
@@ -578,7 +592,7 @@ _RUN_SBATCH = """\
 #SBATCH --error=error.err
 #SBATCH --time=23:59:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node={ntasks}
 
 chmod 755 run.sh
 ./run.sh
@@ -615,8 +629,14 @@ rm -f references/*
 
 def _write_cluster_scripts(sim: SimConfig, out: Path) -> None:
     """Write run.sh, run.sbatch, postpro.sh, clean.sh into the sim dir."""
-    (out / "run.sh").write_text(_RUN_SH)
-    (out / "run.sbatch").write_text(_RUN_SBATCH.format(sim_name=sim.sim_name))
+    if sim.parallel:
+        body = _RUN_SH_PARALLEL.format(nsub=sim.nsub, sim_name=sim.sim_name)
+        ntasks = sim.nsub
+    else:
+        body = _RUN_SH_SERIAL
+        ntasks = 1
+    (out / "run.sh").write_text(_RUN_SH_HEADER + body)
+    (out / "run.sbatch").write_text(_RUN_SBATCH.format(sim_name=sim.sim_name, ntasks=ntasks))
     (out / "postpro.sh").write_text(_POSTPRO_SH.format(sim_name=sim.sim_name))
     (out / "clean.sh").write_text(_CLEAN_SH)
     print("  Wrote run.sh, run.sbatch, postpro.sh, clean.sh")
