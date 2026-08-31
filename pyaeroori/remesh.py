@@ -370,10 +370,23 @@ def _build_region(
         return []
 
     surf_tags: list[int] = []
+    skipped_midpoints = 0
+    dropped_panels: list[list] = []
+    filled_panels = 0
     for face in interior:
         n = len(face)
         # Translate local pids → Gmsh point tags, then build curve loop
         gtags = [add_pt(pid_xyz[lid], region.mesh_size) for lid in face]
+        # Points already placed anywhere on *this panel's* boundary. A new
+        # midpoint can collide with a point other than its own edge's two
+        # endpoints too — e.g. a corner or another edge's midpoint placed
+        # earlier in this same loop, if two edges of a narrow panel converge
+        # close enough in 3D for add_pt's _NODE_MERGE_TOL bucket to merge
+        # them — so collisions have to be checked panel-wide, not just
+        # against this edge's own a/b (checking only a/b let exactly that
+        # case through and crashed gmsh.model.occ.addLine on flasher_N10's
+        # band, whose short crease edges converge this closely).
+        used_tags: set[int] = set(gtags)
         lines, ok = [], True
         for i in range(n):
             a, b = gtags[i], gtags[(i + 1) % n]
@@ -381,6 +394,7 @@ def _build_region(
                 ok = False
                 break
             is_crease = edge_has_crease.get(frozenset((face[i], face[(i + 1) % n])), False)
+            mid = None
             if region.add_edge_midpoints and is_crease:
                 # This edge is a single unsplit crease segment here (any edge
                 # that already had a T-junction or pre-split CSV point would
@@ -391,6 +405,21 @@ def _build_region(
                 # sliver elements for no benefit.
                 mid_xyz = (pid_xyz[face[i]] + pid_xyz[face[(i + 1) % n]]) / 2
                 mid = add_pt(mid_xyz, region.mesh_size)
+                # add_pt buckets by _NODE_MERGE_TOL — on a crease edge shorter
+                # than ~2x that tolerance, the midpoint snaps into the same
+                # bucket as an already-used point (its own endpoint, or a
+                # point from elsewhere on this panel — see used_tags above).
+                # gmsh.model.occ.addLine then gets asked for a zero-length
+                # line and raises. That edge is too short to usefully bisect
+                # anyway (the point it collided with is already <1 merge-tol
+                # away), so fall through to the unsplit add_line(a, b) below
+                # instead of crashing the whole remesh.
+                if mid in used_tags:
+                    skipped_midpoints += 1
+                    mid = None
+                else:
+                    used_tags.add(mid)
+            if mid is not None:
                 lines.append(add_line(a, mid))
                 lines.append(add_line(mid, b))
             else:
@@ -399,12 +428,54 @@ def _build_region(
             continue
         try:
             loop = gmsh.model.occ.addCurveLoop(lines)
-            surf = gmsh.model.occ.addPlaneSurface([loop])
-            surf_tags.append(surf)
-            panel_surf_map[surf] = panel_counter[0]
-            panel_counter[0] += 1
         except Exception:
+            dropped_panels.append([pid_xyz[lid].tolist() for lid in face])
             continue
+        try:
+            surf = gmsh.model.occ.addPlaneSurface([loop])
+        except Exception:
+            # addPlaneSurface fits an exact plane through the wire and can
+            # reject a loop that's only slightly non-planar (e.g. a few mm
+            # of deviation over a panel a few tens of cm across) — seen on
+            # loops through a T-junction where a crease-file vertex is
+            # duplicated a few cm apart (see flasher_N10's short crease
+            # edges). addSurfaceFilling is a more tolerant fit (used for
+            # curved/near-planar wires generally) and succeeds on exactly
+            # this kind of loop without changing the panel's own vertices —
+            # try it before giving up on the panel entirely.
+            try:
+                surf = gmsh.model.occ.addSurfaceFilling(loop)
+                filled_panels += 1
+            except Exception:
+                # Still no good — usually a loop that's genuinely
+                # self-intersecting/degenerate, not just non-planar.
+                # Silently dropping it would otherwise show up downstream
+                # as an unexplained hole in the meshed panel — surfaced
+                # below instead.
+                dropped_panels.append([pid_xyz[lid].tolist() for lid in face])
+                continue
+        surf_tags.append(surf)
+        panel_surf_map[surf] = panel_counter[0]
+        panel_counter[0] += 1
+
+    if filled_panels:
+        print(f"    {filled_panels} panel(s) in region '{region.name}' needed "
+              f"addSurfaceFilling (slightly non-planar loop) instead of addPlaneSurface.")
+
+    if dropped_panels:
+        centroid = np.mean([np.mean(f, axis=0) for f in dropped_panels], axis=0)
+        print(f"    WARNING: {len(dropped_panels)} panel(s) in region '{region.name}' "
+              f"could not be surfaced by Gmsh at all (mesh hole) — genuinely "
+              f"self-intersecting/degenerate loop, not just non-planar. "
+              f"e.g. near {centroid.round(3).tolist()}. First dropped face verts: "
+              f"{dropped_panels[0]}")
+
+    if skipped_midpoints:
+        print(f"    WARNING: {skipped_midpoints} crease-edge midpoint(s) in region "
+              f"'{region.name}' snapped onto their own endpoint (edge shorter than "
+              f"~2x _NODE_MERGE_TOL) and were left unbisected — those edges won't "
+              f"get a guaranteed joint node from add_edge_midpoints. Check "
+              f"check_mesh_crease_resolution() coverage for region '{region.name}'.")
 
     return surf_tags
 
@@ -770,6 +841,195 @@ def _gmsh_to_mesh(panel_surf_map: dict[int, int]) -> Mesh:
                 eid += 1
 
     return Mesh(nodes=nodes, elements=elements, panel_map=panel_map)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3.5 (optional): post-process refinement of skinny panels
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refine_skinny_panels(
+    mesh: Mesh,
+    skinny_min_edge:   float = 0.02,
+    skinny_edge_ratio: float = 4.0,
+    max_target_edge:   float = 0.05,
+    max_subdivisions:  int   = 20,
+) -> Mesh:
+    """
+    Optional post-process, run *after* remesh() — not part of Path A/B
+    themselves. Locally refines any panel that has a genuinely tiny edge
+    (a real feature of some crease patterns, e.g. flasher_N10's band — see
+    Region's add_edge_midpoints docstring), by repeatedly bisecting that
+    panel's longest *internal* edge: an edge where every element touching
+    it (mesh-wide, not just within the panel) belongs to this same panel.
+
+    Why internal-only is safe: Step 4 (build_surrogate) places a driver
+    joint only where a mesh edge is touched by exactly two *different*
+    panels (surrogate.py's edge_panels/crease_edges) — that's the only
+    thing that makes an edge a "crease" edge at all. An internal edge, by
+    definition, can never be one, so bisecting it can never disturb an
+    existing joint or need a matching change on a neighboring panel — no
+    cross-panel coordination is needed, unlike trying to do this inside
+    remesh() itself against Gmsh's OCC curve loops (which is fragile on
+    exactly this kind of extreme-aspect-ratio boundary — this function
+    exists because that approach didn't hold up). New nodes created here
+    just aren't touched by two different panels, so Step 4 naturally never
+    places a joint on them — nothing further to do to keep them un-jointed.
+
+    A panel's *boundary* edges (crease edges shared with a neighbor, or
+    true rim/vent edges) are never touched, even if short/skewed — fixing
+    those would need the neighbor panel refined in lockstep, which this
+    function deliberately doesn't attempt. In practice the worst offenders
+    are often internal Gmsh-triangulation artifacts smaller than the
+    boundary crease edge itself (e.g. flasher's actual worst panel has a
+    7mm *internal* edge vs. its 1.4cm boundary crease edge), so this still
+    reaches the elements most likely to collapse first.
+
+    Mutates `mesh` in place (extends nodes/elements/panel_map) and returns
+    it for chaining. Only 3-node (triangle) elements are refined; any
+    4-node (quad) elements in a flagged panel are left untouched.
+
+    Parameters
+    ----------
+    skinny_min_edge   : a panel is flagged only if its shortest edge
+                         (across all its elements) is below this (metres).
+    skinny_edge_ratio : ...and its longest/shortest edge ratio is at least
+                         this. Both must hold — ratio alone also catches
+                         ordinary long, thin panels that mesh fine as-is.
+    max_target_edge   : stop bisecting a panel's longest internal edge once
+                         it's at or below this length.
+    max_subdivisions  : hard cap on bisections per flagged panel.
+    """
+    # ── Global safety index: for every mesh edge, which panel(s) touch it ──
+    edge_panels: dict[frozenset, set[int]] = defaultdict(set)
+    edge_elems:  dict[frozenset, list[int]] = defaultdict(list)
+    for eid, (etype, nids) in mesh.elements.items():
+        if len(nids) < 3:
+            continue
+        pid = mesh.panel_map.get(eid)
+        if pid is None:
+            continue
+        n = len(nids)
+        for i in range(n):
+            e = frozenset((nids[i], nids[(i + 1) % n]))
+            edge_panels[e].add(pid)
+            edge_elems[e].append(eid)
+
+    # ── Flag panels with a genuinely tiny edge ──────────────────────────────
+    panel_elems: dict[int, list[int]] = defaultdict(list)
+    for eid, pid in mesh.panel_map.items():
+        panel_elems[pid].append(eid)
+
+    def _tri_edge_lengths(nids: list[int]) -> list[float]:
+        n = len(nids)
+        return [
+            float(np.linalg.norm(np.array(mesh.nodes[nids[i]]) - np.array(mesh.nodes[nids[(i + 1) % n]])))
+            for i in range(n)
+        ]
+
+    flagged: list[int] = []
+    for pid, eids in panel_elems.items():
+        lens = [L for eid in eids for L in _tri_edge_lengths(mesh.elements[eid][1])]
+        if not lens:
+            continue
+        shortest, longest = min(lens), max(lens)
+        if shortest > 1e-9 and shortest < skinny_min_edge and longest / shortest >= skinny_edge_ratio:
+            flagged.append(pid)
+
+    if not flagged:
+        return mesh
+
+    next_nid = max(mesh.nodes) + 1
+    next_eid = max(mesh.elements) + 1
+    total_bisections = 0
+
+    for pid in flagged:
+        # Local working copy: {eid: (etype, nids)}, restricted to triangles.
+        local: dict[int, tuple[int, list[int]]] = {
+            eid: mesh.elements[eid] for eid in panel_elems[pid] if len(mesh.elements[eid][1]) == 3
+        }
+        original_eids = set(local.keys())
+        prev_len = None
+
+        for _ in range(max_subdivisions):
+            # Recompute this panel's current internal edges: every element
+            # touching the edge (mesh-wide) must be this same panel — for a
+            # brand-new edge created by a split below, it's not in the
+            # global index at all yet, so it's trivially internal (only
+            # this panel's local elements can possibly reference it).
+            local_edge_elems: dict[frozenset, list[int]] = defaultdict(list)
+            for eid, (etype, nids) in local.items():
+                for i in range(3):
+                    e = frozenset((nids[i], nids[(i + 1) % 3]))
+                    local_edge_elems[e].append(eid)
+
+            best_edge, best_len = None, -1.0
+            for e, leids in local_edge_elems.items():
+                if len(leids) != 2:
+                    continue   # touched by only 1 element here: a rim edge
+                               # of this panel (or, mid-refinement, a fresh
+                               # spoke not yet re-split) — leave it; chasing
+                               # these as "longest" is what cascaded into a
+                               # runaway near-zero-length edge before this
+                               # check was added. Only bisect edges genuinely
+                               # interior to the panel's own triangulation.
+                touching_panels = edge_panels.get(e, set())
+                if touching_panels - {pid}:
+                    continue   # shared with a different panel — never touch
+                a, b = tuple(e)
+                L = float(np.linalg.norm(np.array(mesh.nodes[a]) - np.array(mesh.nodes[b])))
+                if L > best_len:
+                    best_edge, best_len = e, L
+
+            if best_edge is None or best_len <= max_target_edge:
+                break
+            if prev_len is not None and best_len >= prev_len * 0.9:
+                # max_target_edge can be geometrically unreachable for a
+                # panel's actual shape — e.g. a fan of spokes converging on
+                # one nearby vertex, where the spoke length approaches a
+                # fixed floor no further bisection reduces. Chasing that
+                # anyway (seen on flasher_N10's band) doesn't converge; it
+                # just keeps fanning out thinner and thinner slivers around
+                # that vertex until float precision itself produces a
+                # near-zero-length edge. Stop as soon as a bisection stops
+                # making meaningful progress, rather than trusting
+                # max_target_edge is always achievable.
+                break
+            prev_len = best_len
+
+            # Bisect best_edge at its midpoint for every (1 or 2) local
+            # triangle touching it.
+            a, b = tuple(best_edge)
+            mid_xyz = tuple((np.array(mesh.nodes[a]) + np.array(mesh.nodes[b])) / 2)
+            m = next_nid
+            next_nid += 1
+            mesh.nodes[m] = mid_xyz
+
+            for eid in local_edge_elems[best_edge]:
+                etype, nids = local[eid]
+                i = next(i for i in range(3) if frozenset((nids[i], nids[(i + 1) % 3])) == best_edge)
+                na, nb, nc = nids[i], nids[(i + 1) % 3], nids[(i + 2) % 3]
+                del local[eid]
+                local[next_eid] = (etype, [na, m, nc]); next_eid += 1
+                local[next_eid] = (etype, [m, nb, nc]); next_eid += 1
+
+            total_bisections += 1
+
+        # Commit: drop this panel's original element ids, add the final
+        # local set (untouched originals keep their id; split pieces are
+        # already fresh ids).
+        for eid in original_eids:
+            if eid not in local:
+                del mesh.elements[eid]
+                del mesh.panel_map[eid]
+        for eid, elem in local.items():
+            mesh.elements[eid] = elem
+            mesh.panel_map[eid] = pid
+
+    if total_bisections:
+        print(f"  refine_skinny_panels: {len(flagged)} flagged panel(s), "
+              f"{total_bisections} edge bisection(s) total.")
+
+    return mesh
 
 
 # ─────────────────────────────────────────────────────────────────────────────

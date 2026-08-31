@@ -159,7 +159,9 @@ config = add_physics(
     cables=[
         # The mesh has 4 suspension lines (type-6 beams) in the TOPOLOGY section
         # (no named blocks). all_bars detects them automatically and converts
-        # each 5-element chain into a single type-203 tension-only spring.
+        # each 5-element chain into a single type-200 axial spring (tension
+        # and compression). Add "segments": N here to split each chain into
+        # N springs through free interior nodes instead (see add_physics()).
         {"all_bars": True, "tol": 0.05},
     ],
 )

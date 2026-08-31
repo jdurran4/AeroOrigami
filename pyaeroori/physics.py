@@ -178,14 +178,20 @@ class ModelConfig:
 
     Pass to write_aeros(surrogate, output_dir, config=config).
 
-    cable_nodes    : new nodes to append to NODES (beyond surrogate.nodes)
-    cable_elements : new bar elements (eid, etype=2, [na, nb]) for TOPOLOGY
+    cable_nodes    : new nodes to append to NODES (beyond surrogate.nodes) —
+                     includes both real endpoint anchors and, for segmented
+                     cables, the free interior nodes between segments.
+    cable_elements : new bar elements (eid, etype=2, [na, nb], stiffness_mult)
+                     for TOPOLOGY. stiffness_mult multiplies SimConfig.cable_stiffness
+                     for this element (1.0 for unsegmented cables; equal to the
+                     segment count for segmented cables, so N springs in series
+                     reproduce the same end-to-end axial stiffness as one).
     """
-    disp_bcs:        list[tuple[int, list[int]]]           = field(default_factory=list)
-    lmpc_rows:       list[LmpcRow]                         = field(default_factory=list)
-    force_bcs:       list[tuple[int, float, float, float]] = field(default_factory=list)
-    cable_nodes:     dict[int, tuple[float, float, float]] = field(default_factory=dict)
-    cable_elements:  list[tuple[int, int, list[int]]]      = field(default_factory=list)
+    disp_bcs:        list[tuple[int, list[int]]]              = field(default_factory=list)
+    lmpc_rows:       list[LmpcRow]                            = field(default_factory=list)
+    force_bcs:       list[tuple[int, float, float, float]]    = field(default_factory=list)
+    cable_nodes:     dict[int, tuple[float, float, float]]    = field(default_factory=dict)
+    cable_elements:  list[tuple[int, int, list[int], float]]  = field(default_factory=list)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -252,10 +258,28 @@ def add_physics(
     cables    : Cable element chains — list of dicts.
 
                 Each cable specification detects connected chains of 2-node
-                elements and replaces each chain with a SINGLE type-203
-                tension-only spring between the chain's two endpoint nodes.
-                For a star topology (N lines converging at one confluence
-                node), N springs are created, one per arm.
+                elements and replaces each chain with type-200 axial springs
+                (tension AND compression — see design_notes.md) between the
+                chain's two endpoint nodes. For a star topology (N lines
+                converging at one confluence node), N chains are created,
+                one per arm.
+
+                ``"segments": int`` (default 1, any form above)
+                  Split each detected chain into this many type-200 springs
+                  in series instead of one, adding free interior nodes
+                  arc-length-resampled along the chain's original geometry
+                  (or, for ``points=``, along the given point polyline).
+                  Interior nodes carry no BCs — they're free to move out of
+                  plane, so a segmented chain can sag/bow and its endpoints
+                  can draw closer together even though each rigid segment
+                  only resists axial stretch/compression like an unsegmented
+                  cable. Use this for lines that must not lengthen overall
+                  but should be free to go slack. Each segment's stiffness
+                  is auto-scaled to ``segments * SimConfig.cable_stiffness``
+                  so the chain's end-to-end series stiffness matches an
+                  unsplit spring's (springs in series soften by 1/N
+                  otherwise); segmented chains get their own MATERIAL
+                  attribute, written by write_aeros().
 
                 ``{"block": "<name>", "tol": float}``
                   From a named block in the original mesh (requires mesh=).
@@ -310,13 +334,14 @@ def add_physics(
     for spec in cables:
         tol = float(spec.get("tol", 1e-3))
         anchor_threshold = float(spec.get("anchor_threshold", _DEFAULT_ANCHOR_THRESHOLD))
+        segments = int(spec.get("segments", 1))
 
         if "block" in spec:
             if mesh is None:
                 print(f"  WARNING: cable block='{spec['block']}' requires mesh= parameter — skipped")
                 continue
             _add_cable_chains_from_elems(
-                spec["block"], mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
+                spec["block"], mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold, segments
             )
 
         elif "blocks" in spec:
@@ -325,7 +350,7 @@ def add_physics(
                 continue
             for bname in spec["blocks"]:
                 _add_cable_chains_from_elems(
-                    bname, mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
+                    bname, mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold, segments
                 )
 
         elif spec.get("all_bars"):
@@ -333,13 +358,13 @@ def add_physics(
                 print("  WARNING: all_bars=True requires mesh= parameter — skipped")
                 continue
             _add_all_cable_chains(
-                mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold
+                mesh, surrogate, config, next_nid, next_eid, tol, anchor_threshold, segments
             )
 
         elif "points" in spec:
             pts   = [tuple(float(v) for v in p) for p in spec["points"]]
             label = spec.get("label", "explicit")
-            _add_cable_from_points(pts, tol, label, surrogate, config, next_nid, next_eid, anchor_threshold)
+            _add_cable_from_points(pts, tol, label, surrogate, config, next_nid, next_eid, anchor_threshold, segments)
 
         else:
             print(f"  WARNING: cable entry missing 'block', 'blocks', 'all_bars', or 'points' — skipped: {spec}")
@@ -580,14 +605,18 @@ def _find_or_add_node(
     return nid
 
 
-def _build_cable_chains(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def _build_cable_chains(pairs: list[tuple[int, int]]) -> list[list[int]]:
     """
     Given a list of (na, nb) node-ID pairs from bar elements, return the
-    (start_node, end_node) endpoints of each cable chain.
+    full node-ID path of each cable chain (ordered from one endpoint to the
+    other, including intermediate nodes) — path[0]/path[-1] are the chain's
+    endpoints; interior IDs give the chain's real geometry, used to place
+    segment break points when ``segments`` > 1.
 
     Algorithm: degree-1 leaf nodes are the true cable endpoints. From each
     leaf, trace through degree-2 nodes until hitting another leaf or a
-    junction (degree ≠ 2). Each traced path becomes one spring.
+    junction (degree ≠ 2). Each traced path becomes one spring (or spring
+    chain, if segmented).
 
     Handles both simple chains (2 leaves) and star/tree topologies (N arms
     converging at a shared confluence node).
@@ -604,7 +633,7 @@ def _build_cable_chains(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
     degree = {n: len(adj[n]) for n in all_nodes}
     leaves = sorted(n for n, d in degree.items() if d == 1)
 
-    chains: list[tuple[int, int]] = []
+    chains: list[list[int]] = []
     seen_pairs: set[tuple[int, int]] = set()
     visited_edges: set[tuple[int, int]] = set()
 
@@ -630,13 +659,79 @@ def _build_cable_chains(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
             key = (min(start, path[-1]), max(start, path[-1]))
             if key not in seen_pairs:
                 seen_pairs.add(key)
-                chains.append((start, path[-1]))
+                chains.append(path)
 
     if not chains:
         # Fallback: no degree-1 nodes (closed loops); return nothing with warning
         print("  WARNING: cable chain detection found no leaf nodes (closed loop?)")
 
     return chains
+
+
+def _resample_polyline(pts: list, n_segments: int) -> list:
+    """
+    Arc-length-uniform resample of an ordered polyline into n_segments + 1
+    points, endpoints preserved exactly.
+    """
+    arr = np.asarray(pts, dtype=float)
+    seg_len = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total = cum[-1]
+    if total < 1e-12:
+        return [arr[0].copy() for _ in range(n_segments + 1)]
+
+    out = []
+    for t in np.linspace(0.0, total, n_segments + 1):
+        i = min(max(int(np.searchsorted(cum, t, side="right")) - 1, 0), len(arr) - 2)
+        frac = 0.0 if seg_len[i] < 1e-12 else (t - cum[i]) / seg_len[i]
+        out.append(arr[i] + frac * (arr[i + 1] - arr[i]))
+    return out
+
+
+def _emit_cable_chain(
+    path_pts: list,
+    sid_a:    int,
+    sid_b:    int,
+    segments: int,
+    config:   ModelConfig,
+    _nid:     list,
+    _eid:     list,
+) -> None:
+    """
+    Emit type-200 spring element(s) for one cable chain between sid_a/sid_b.
+
+    ``path_pts`` is the chain's ordered polyline (path_pts[0]/[-1] MUST equal
+    the true coordinates of sid_a/sid_b — callers substitute the resolved
+    node's coordinates for the raw endpoint, in case _find_or_add_node
+    snapped to a nearby node).
+
+    segments <= 1: single spring, stiffness multiplier 1.0 (existing
+    unsegmented behaviour, unchanged).
+    segments >  1: `segments` springs in series through `segments - 1` new
+    free interior nodes, arc-length-resampled along path_pts. Each spring's
+    stiffness multiplier is `segments`, so the chain's end-to-end series
+    stiffness matches an unsplit spring's (springs in series soften by 1/N
+    otherwise) — see add_physics()'s cables= docstring.
+    """
+    if segments <= 1:
+        config.cable_elements.append((_eid[0], 2, [sid_a, sid_b], 1.0))
+        _eid[0] += 1
+        return
+
+    samples = _resample_polyline(path_pts, segments)
+
+    node_chain = [sid_a]
+    for pt in samples[1:-1]:
+        nid = _nid[0]
+        _nid[0] += 1
+        config.cable_nodes[nid] = (float(pt[0]), float(pt[1]), float(pt[2]))
+        node_chain.append(nid)
+    node_chain.append(sid_b)
+
+    mult = float(segments)
+    for na, nb in zip(node_chain[:-1], node_chain[1:]):
+        config.cable_elements.append((_eid[0], 2, [na, nb], mult))
+        _eid[0] += 1
 
 
 def _counters(config: ModelConfig, nid0: int, eid0: int):
@@ -655,8 +750,9 @@ def _add_cable_chains_from_elems(
     next_eid:         int,
     tol:              float = 1e-3,
     anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
+    segments:         int = 1,
 ) -> None:
-    """Map a named mesh block's 2-node elements to surrogate as chain-end springs."""
+    """Map a named mesh block's 2-node elements to surrogate as chain-end spring(s)."""
     block_eids = mesh.blocks.get(block_name)
     if not block_eids:
         print(f"  WARNING: block '{block_name}' not found in mesh — skipped")
@@ -673,14 +769,17 @@ def _add_cable_chains_from_elems(
 
     _nid, _eid = _counters(config, next_nid, next_eid)
     n_added = 0
-    for na, nb in _build_cable_chains(pairs):
+    for path in _build_cable_chains(pairs):
+        na, nb = path[0], path[-1]
         sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, block_name, anchor_threshold)
         sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, block_name, anchor_threshold)
-        config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
-        _eid[0] += 1
+        lookup = {**surrogate.nodes, **config.cable_nodes}
+        path_pts = [lookup[sid_a]] + [mesh.nodes[n] for n in path[1:-1]] + [lookup[sid_b]]
+        _emit_cable_chain(path_pts, sid_a, sid_b, segments, config, _nid, _eid)
         n_added += 1
 
-    print(f"  Cable block '{block_name}': {len(pairs)} bars → {n_added} spring(s)")
+    seg_note = f", {segments} segment(s) each" if segments > 1 else ""
+    print(f"  Cable block '{block_name}': {len(pairs)} bars → {n_added} chain(s){seg_note}")
 
 
 def _add_all_cable_chains(
@@ -691,8 +790,9 @@ def _add_all_cable_chains(
     next_eid:         int,
     tol:              float = 1e-3,
     anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
+    segments:         int = 1,
 ) -> None:
-    """Map ALL 2-node elements in the mesh to surrogate as chain-end springs."""
+    """Map ALL 2-node elements in the mesh to surrogate as chain-end spring(s)."""
     cable_elems = mesh.cable_elements
     if not cable_elems:
         print("  Cable all_bars: no 2-node elements found in mesh")
@@ -703,14 +803,17 @@ def _add_all_cable_chains(
 
     _nid, _eid = _counters(config, next_nid, next_eid)
     n_added = 0
-    for na, nb in chains:
+    for path in chains:
+        na, nb = path[0], path[-1]
         sid_a = _find_or_add_node(mesh.nodes[na], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars", anchor_threshold)
         sid_b = _find_or_add_node(mesh.nodes[nb], surrogate.nodes, config.cable_nodes, _nid, tol, "all_bars", anchor_threshold)
-        config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
-        _eid[0] += 1
+        lookup = {**surrogate.nodes, **config.cable_nodes}
+        path_pts = [lookup[sid_a]] + [mesh.nodes[n] for n in path[1:-1]] + [lookup[sid_b]]
+        _emit_cable_chain(path_pts, sid_a, sid_b, segments, config, _nid, _eid)
         n_added += 1
 
-    print(f"  Cable all_bars: {len(cable_elems)} bars → {n_added} spring(s)")
+    seg_note = f", {segments} segment(s) each" if segments > 1 else ""
+    print(f"  Cable all_bars: {len(cable_elems)} bars → {n_added} chain(s){seg_note}")
 
 
 def _add_cable_from_points(
@@ -722,8 +825,9 @@ def _add_cable_from_points(
     next_nid:         int,
     next_eid:         int,
     anchor_threshold: float = _DEFAULT_ANCHOR_THRESHOLD,
+    segments:         int = 1,
 ) -> None:
-    """Create ONE tension-only spring between the first and last point in the list."""
+    """Create spring(s) between the first and last point in the list."""
     if len(pts) < 2:
         print(f"  WARNING: cable '{label}' needs at least 2 points — skipped")
         return
@@ -731,7 +835,13 @@ def _add_cable_from_points(
     _nid, _eid = _counters(config, next_nid, next_eid)
     sid_a = _find_or_add_node(pts[0],  surrogate.nodes, config.cable_nodes, _nid, tol, label, anchor_threshold)
     sid_b = _find_or_add_node(pts[-1], surrogate.nodes, config.cable_nodes, _nid, tol, label, anchor_threshold)
-    config.cable_elements.append((_eid[0], 2, [sid_a, sid_b]))
+    lookup = {**surrogate.nodes, **config.cable_nodes}
+    path_pts = [lookup[sid_a], *pts[1:-1], lookup[sid_b]]
+    _emit_cable_chain(path_pts, sid_a, sid_b, segments, config, _nid, _eid)
 
-    print(f"  Cable '{label}': 1 spring  node {sid_a} → node {sid_b}"
-          f"  ({len(pts)} intermediate points ignored)")
+    if segments > 1:
+        print(f"  Cable '{label}': {segments} segments  node {sid_a} → node {sid_b}"
+              f"  (resampled along {len(pts)} given point(s))")
+    else:
+        print(f"  Cable '{label}': 1 spring  node {sid_a} → node {sid_b}"
+              f"  ({len(pts)} intermediate points ignored)")

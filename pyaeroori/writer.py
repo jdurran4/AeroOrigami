@@ -37,12 +37,23 @@ if TYPE_CHECKING:
     from .physics import ModelConfig
 
 # Attribute IDs — must match AERO-S ATTRIBUTES section
-_SHELL_ATTR     = 1    # all shell elements (types 15 / 1515)
-_SPH_ATTR       = 2    # all spherical joints (type 120)
-_REV_ATTR_START = 3    # revolute joints start here, one per joint (type 126)
-_CABLE_ATTR     = 10000  # cable springs (type 200)
-# NOTE: _REV_ATTR_START + len(revolute_joints) can reach thousands, so cable
-# attr must be a large fixed value that won't collide with revolute joint attrs.
+_SHELL_ATTR      = 1    # all shell elements (types 15 / 1515)
+_SPH_ATTR        = 2    # all spherical joints (type 120)
+_REV_ATTR_START  = 3    # revolute joints start here, one per joint (type 126)
+_CABLE_ATTR      = 10000  # unsegmented cable springs, stiffness_mult == 1.0 (type 200)
+_CABLE_SEG_START = 20000  # segmented cable chains start here, one attr per distinct
+# stiffness_mult present in config.cable_elements (segments = N -> mult = N; see
+# add_physics()'s cables= "segments" option). Kept well clear of both
+# _REV_ATTR_START (which can reach thousands) and _CABLE_ATTR.
+
+
+def _cable_attr_map(cable_elements: list) -> dict[float, int]:
+    """{stiffness_mult: attribute_id} for every multiplier present, deterministic order."""
+    attr_map = {1.0: _CABLE_ATTR}
+    others = sorted({mult for _, _, _, mult in cable_elements if mult != 1.0})
+    for i, mult in enumerate(others):
+        attr_map[mult] = _CABLE_SEG_START + i
+    return attr_map
 
 
 @dataclass
@@ -142,12 +153,13 @@ def write_aeros(
     rev_attr: dict[int, int] = {
         j.eid: _REV_ATTR_START + i for i, j in enumerate(rev_joints)
     }
+    cable_attr = _cable_attr_map(config.cable_elements if config else [])
 
     mesh_path = out / "ORIGAMI_MESH.include"
     act_path  = out / "ACTUATORS.include"
     efr_path  = out / "EFRAMES.include"
 
-    _write_mesh(surrogate, mesh_path, sph_joints, rev_joints, rev_attr, config)
+    _write_mesh(surrogate, mesh_path, sph_joints, rev_joints, rev_attr, config, cable_attr)
     _write_actuators(rev_joints, rev_attr, beta, act_path)
     _write_eframes(rev_joints, efr_path)
 
@@ -183,7 +195,7 @@ def write_aeros(
 
     if sim is not None:
         p = out / "MATERIAL.include"
-        _write_material(sim, surrogate.penalty_stiffness, p)
+        _write_material(sim, surrogate.penalty_stiffness, cable_attr, p)
         written["material"] = p
         print(f"  Wrote {p.name}")
 
@@ -206,6 +218,7 @@ def _write_mesh(
     rev_joints: list["JointInfo"],
     rev_attr:   dict[int, int],
     config:     "ModelConfig | None",
+    cable_attr: dict[float, int],
 ) -> None:
     cable_nodes    = config.cable_nodes    if config else {}
     cable_elements = config.cable_elements if config else []
@@ -233,7 +246,7 @@ def _write_mesh(
             f.write(f"  {j.eid}  120  {j.node_a}  {j.node_b}\n")
         for j in rev_joints:
             f.write(f"  {j.eid}  126  {j.node_a}  {j.node_b}\n")
-        for eid, _, nids in cable_elements:
+        for eid, _, nids, _ in cable_elements:
             etype    = _aeros_etype(nids)
             node_str = "  ".join(str(n) for n in nids)
             f.write(f"  {eid}  {etype}  {node_str}\n")
@@ -247,8 +260,8 @@ def _write_mesh(
             f.write(f"  {j.eid}  {_SPH_ATTR}\n")
         for j in rev_joints:
             f.write(f"  {j.eid}  {rev_attr[j.eid]}\n")
-        for eid, _, _ in cable_elements:
-            f.write(f"  {eid}  {_CABLE_ATTR}\n")
+        for eid, _, _, mult in cable_elements:
+            f.write(f"  {eid}  {cable_attr[mult]}\n")
         f.write("*\n")
 
         # ── MATERIAL: spherical joint ─────────────────────────────────────────
@@ -277,12 +290,17 @@ def _write_actuators(
         f.write("*\n")
 
 
-def _write_material(sim: SimConfig, penalty: float, path: Path) -> None:
+def _write_material(sim: SimConfig, penalty: float, cable_attr: dict[float, int], path: Path) -> None:
     """
     Write MATERIAL.include: shell element properties and cable spring stiffness.
 
     Shell (attr 1) format: MID 0 E nu rho 0 0 t 0 0 0 0 0 0 0
-    Cable (attr 10) format: MID SPRINGMAT stiffness
+    Cable format: MID SPRINGMAT stiffness — one line per distinct
+    stiffness_mult in config.cable_elements (unsegmented cables always use
+    _CABLE_ATTR at mult 1.0; segmented chains get their own attr per mult,
+    stiffness = sim.cable_stiffness * mult, so N springs in series reproduce
+    an unsplit spring's end-to-end stiffness — see add_physics()'s cables=
+    "segments" docstring).
     """
     with open(path, "w") as f:
         f.write("MATERIAL\n")
@@ -295,9 +313,10 @@ def _write_material(sim: SimConfig, penalty: float, path: Path) -> None:
             f"  {sim.shell_t:.6f}"
             f"  0  0  0  0  0  0  0\n"
         )
-        f.write(
-            f"  {_CABLE_ATTR}  SPRINGMAT  {sim.cable_stiffness:.6e}\n"
-        )
+        for mult, attr in sorted(cable_attr.items(), key=lambda kv: kv[1]):
+            f.write(
+                f"  {attr}  SPRINGMAT  {sim.cable_stiffness * mult:.6e}\n"
+            )
         f.write("*\n")
 
 

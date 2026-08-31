@@ -110,6 +110,8 @@ Attribute IDs are fixed constants in `writer.py`:
 - 2 → spherical joint CONMAT (in `ORIGAMI_MESH.include`)
 - 3+ → revolute joint CONMAT RAMP, one per joint (in `ACTUATORS.include`)
 - 10000 → cable SPRINGMAT (in `MATERIAL.include`) — large fixed value to avoid colliding with revolute joint attrs, which can number in the thousands
+- 20000+ → segmented cable chains (`cables=[{..., "segments": N}]`), one attr per distinct
+  N present, stiffness = `N × SimConfig.cable_stiffness`
 
 Multiple MATERIAL sections in different INCLUDE files are merged by AERO-S at load
 time — IDs must be globally unique, which they are.
@@ -123,8 +125,17 @@ time — IDs must be globally unique, which they are.
   Static `FORCE` is ignored in DYNAMICS runs. `config.force_bcs` → `USDF.include` +
   `control.C` (compile with `g++ -shared -fPIC control.C -o control.so`).
 - **Cable chain collapse**: Each connected chain of bars → single type-200 axial spring
-  between endpoints. Avoids over-constraining the fold. (Previously type-203
-  tension-only; changed to type-200 to allow compression as well.)
+  between endpoints by default. Avoids over-constraining the fold. (Previously
+  type-203 tension-only; changed to type-200 to allow compression as well — but a
+  single always-active axial spring can't go slack, so a straight-line cable can only
+  get longer or shorter symmetrically.) `cables=[{..., "segments": N}]` splits the
+  chain into N springs through free interior nodes instead: the chain can sag/bow
+  out of plane, so its endpoints can draw closer together without any spring
+  stretching, while still resisting straight-line lengthening — a cheap way to
+  emulate "can shorten, can't lengthen" without a true tension-only element (which
+  caused a singular matrix under the parallel solver). Segment stiffness is
+  auto-scaled by N so the chain's end-to-end series stiffness matches the unsplit
+  case.
 - **Co-located node pinning**: When a DISP BC targets a crease node, all co-located
   duplicates (same rounded coords) are also pinned automatically.
 - **TPS kernel singular matrix**: `RBFInterpolator` with `thin_plate_spline` fails on

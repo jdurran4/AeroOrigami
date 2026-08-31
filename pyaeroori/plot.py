@@ -598,7 +598,7 @@ def plot_physics(
     # ── Cable elements ────────────────────────────────────────────────────────
     if config is not None and config.cable_elements:
         first_cable = True
-        for eid, _, nids in config.cable_elements:
+        for eid, _, nids, _ in config.cable_elements:
             if len(nids) != 2:
                 continue
             n0, n1 = nids
