@@ -85,14 +85,19 @@ All public exports are in `pyaeroori/__init__.py`.
   detected via `_build_cable_chains` — collapses each connected chain of 2-node
   elements to a single type-200 axial spring between endpoints.
 
-- **`writer.py`**: `write_aeros(surrogate, output_dir, config, sim, beta_factor)`.
+- **`writer.py`**: `write_aeros(surrogate, output_dir, config, sim, beta_factor, contact)`.
   Always writes `ORIGAMI_MESH.include`, `ACTUATORS.include`, `EFRAMES.include`.
   When `config` provided: adds `DISP.include`, `LMPC.include`, and if `force_bcs`
   are present, `USDF.include` + `control.C`. When `sim=SimConfig(...)` provided:
   adds `MATERIAL.include`, `fold.fem` (main AERO-S input file, conditional
   INCLUDE lines omitted when unused), and cluster scripts `run.sh`, `run.sbatch`,
-  `postpro.sh`, `clean.sh`. Update path variables in `run.sh`/`postpro.sh` once
-  for your cluster.
+  `postpro.sh`, `clean.sh`. When `contact=ContactConfig(...)` provided: adds
+  `SURFACETOPO.include` (whole surrogate as one faceted surface, wound outward,
+  connectivity remapped to original crease nodes) + `CONTACTSURFACES.include`
+  (that surface self-paired, 1-sided) and their INCLUDE lines in `fold.fem`.
+  Off by default — omitting `contact` is byte-for-byte identical to before.
+  See `docs/design_notes.md` "Self-contact surface". Update path variables in
+  `run.sh`/`postpro.sh` once for your cluster.
 
 - **`plot.py`**: Visualization helpers — `plot_mesh`, `plot_creases`,
   `plot_surrogate_axes`, `plot_physics`, `mesh_stats`, `crease_stats`,
@@ -104,6 +109,10 @@ All public exports are in `pyaeroori/__init__.py`.
 
 Element types in TOPOLOGY: 15 (tri shell), 1515 (quad shell), 120 (spherical joint),
 126 (revolute driver), 200 (axial spring / cable).
+
+SURFACETOPO FACETYPE (contact surface facets, distinct numbering from TOPOLOGY):
+3 (3-node triangle), 1 (4-node quad). `_write_surfacetopo` maps shell node count
+→ facetype; FACE# = shell eid + `ContactConfig.face_id_offset`.
 
 Attribute IDs are fixed constants in `writer.py`:
 - 1 → shell material (in `MATERIAL.include`)

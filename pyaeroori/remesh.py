@@ -62,7 +62,21 @@ class Region:
     Parameters
     ----------
     creases            : fold lines and boundary edges for this region
-    mesh_size          : target Gmsh element edge length (metres) — Path A only
+    mesh_size          : target Gmsh element edge length (metres) — Path A only.
+                         Either a plain float (uniform), or a callable
+                         (x, y, z) -> float for a spatially-varying target,
+                         evaluated at every point as it's added to Gmsh.
+                         Gmsh linearly interpolates its actual mesh size
+                         between points from their individual requested
+                         sizes, so a callable that's small near one feature
+                         (e.g. a vent, where converging gores can otherwise
+                         produce skewed slivers) and larger elsewhere gives
+                         local refinement with no separate Gmsh Field setup.
+                         If callable, mesh_size_bounds must also be given.
+    mesh_size_bounds   : (min, max) the callable can return — used to set
+                         Gmsh's global CharacteristicLengthMin/Max (which a
+                         plain float mesh_size derives from itself). Ignored
+                         when mesh_size is a plain float.
     projection         : '\'auto\'' | '\'planar\'' | '\'cylindrical\'' | '\'tangent\''
     name               : label for Gmsh Physical Group / AEROS output
     use_crease_mesh    : True → Path B (crease polygons as shell elements, no Gmsh)
@@ -83,12 +97,30 @@ class Region:
                          segments).
     """
     creases:            CreasePattern
-    mesh_size:          float = 0.2
+    mesh_size:          float | Callable[[tuple], float] = 0.2
+    mesh_size_bounds:   tuple[float, float] | None = None
     projection:         str   = "auto"
     name:               str   = ""
     use_crease_mesh:    bool  = False
     add_edge_midpoints: bool  = False
     outward_normal:     tuple | None = None  # hint for build_surrogate panel-normal orientation
+
+
+def _size_bounds(r: Region) -> tuple[float, float]:
+    """(min, max) a Region's mesh_size can produce — see Region.mesh_size_bounds."""
+    if callable(r.mesh_size):
+        if r.mesh_size_bounds is None:
+            raise ValueError(
+                f"Region '{r.name}': mesh_size is a callable — "
+                f"mesh_size_bounds=(min, max) must also be given."
+            )
+        return r.mesh_size_bounds
+    return (r.mesh_size, r.mesh_size)
+
+
+def _resolve_size(ms, xyz) -> float:
+    """Evaluate a Region.mesh_size (float or callable) at one point."""
+    return float(ms(xyz)) if callable(ms) else float(ms)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,8 +183,8 @@ def remesh(
     edge_map: dict[frozenset, int] = {}
     dir_map:  dict[tuple, int]     = {}
 
-    lo = min(r.mesh_size for r in regions)
-    hi = max(r.mesh_size for r in regions)
+    lo = min(_size_bounds(r)[0] for r in regions)
+    hi = max(_size_bounds(r)[1] for r in regions)
 
     def add_pt(xyz, mesh_size: float = lo) -> int:
         # Points shared between regions (stitched boundary nodes) keep
@@ -376,7 +408,7 @@ def _build_region(
     for face in interior:
         n = len(face)
         # Translate local pids → Gmsh point tags, then build curve loop
-        gtags = [add_pt(pid_xyz[lid], region.mesh_size) for lid in face]
+        gtags = [add_pt(pid_xyz[lid], _resolve_size(region.mesh_size, pid_xyz[lid])) for lid in face]
         # Points already placed anywhere on *this panel's* boundary. A new
         # midpoint can collide with a point other than its own edge's two
         # endpoints too — e.g. a corner or another edge's midpoint placed
@@ -404,7 +436,7 @@ def _build_region(
                 # skipped — bisecting them would just be wasted, skewed
                 # sliver elements for no benefit.
                 mid_xyz = (pid_xyz[face[i]] + pid_xyz[face[(i + 1) % n]]) / 2
-                mid = add_pt(mid_xyz, region.mesh_size)
+                mid = add_pt(mid_xyz, _resolve_size(region.mesh_size, mid_xyz))
                 # add_pt buckets by _NODE_MERGE_TOL — on a crease edge shorter
                 # than ~2x that tolerance, the midpoint snaps into the same
                 # bucket as an already-used point (its own endpoint, or a

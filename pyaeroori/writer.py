@@ -22,7 +22,14 @@ When sim (SimConfig) is also passed
 ------------------------------------
 MATERIAL.include       Shell + cable spring material properties
 fold.fem               Main AERO-S input file with configurable parameters;
-                       INCLUDE lines for LMPC / USDF / DISP omitted when unused
+                       INCLUDE lines for LMPC / USDF / DISP / contact omitted
+                       when unused
+
+When contact (ContactConfig) is also passed
+-------------------------------------------
+SURFACETOPO.include      Whole shell surrogate as one faceted surface, wound
+                         outward, connectivity remapped to original crease nodes
+CONTACTSURFACES.include  That surface paired with itself (1-sided self-contact)
 """
 
 from __future__ import annotations
@@ -102,6 +109,45 @@ class SimConfig:
     nsub:            int   = 10       # number of subdomains (mpirun -np, --nsub)
 
 
+@dataclass
+class ContactConfig:
+    """
+    Optional self-contact detection / enforcement for the origami surrogate.
+
+    Passing a ContactConfig to write_aeros(..., contact=...) is non-destructive:
+    it adds SURFACETOPO.include and CONTACTSURFACES.include, and — when `sim` is
+    also given — the matching INCLUDE lines in fold.fem. Nothing else in the
+    output changes; omit `contact` and behaviour is exactly as before.
+
+    The entire shell surrogate is treated as ONE surface, paired with itself.
+    Facet connectivity is remapped to original (pre-duplication) crease nodes
+    (Surrogate.node_origin) so panels meeting at a fold share that edge: the
+    surface is watertight and ACME automatically skips the hinge-adjacent facet
+    slivers that would otherwise register as spurious contact. Each facet is
+    wound so its normal points along the panel's outward normal
+    (Surrogate.panel_normals) — an implicit-dynamic run is always 1-sided, so
+    contact is only detected between facets whose normals oppose. See
+    docs/design_notes.md.
+
+    Fields map to the static / implicit-dynamic CONTACTSURFACES row:
+        SURF_PAIR_ID#  MASTER  SLAVE  MORTAR_TYPE  NORMAL_TOL  TANGENTIAL_TOL
+    CONSTRAINT_METHOD is deliberately omitted so it inherits the method from the
+    CONSTRAINTS command already in fold.fem (penalty, SimConfig.lmpc_penalty).
+    """
+    surf_id:        int   = 1      # SURFACETOPO surface ID (MASTER == SLAVE == this)
+    pair_id:        int   = 1      # SURF_PAIR_ID#
+    thickness:      float = 0.0    # SURFACETOPO thickness value t; >0 lofts the
+                                   # surface +0.5t along its outward normal (still
+                                   # 1-sided under implicit dynamics). 0 = none.
+    mortar_type:    int   = 0      # 0 = standard, 1 = dual
+    normal_tol:     float = 0.1    # ACME normal search tol — must exceed the distance
+                                   # a surface point moves in one time step
+    tangential_tol: float = 1e-3   # ACME tangential search tol — ~0.5–50 % of the
+                                   # minimum face edge length
+    face_id_offset: int   = 0      # added to the shell eid to form FACE#; bump only
+                                   # if collisions with TOPOLOGY element IDs matter
+
+
 # ── AERO-S element type mapping ───────────────────────────────────────────────
 
 def _aeros_etype(nids: list[int]) -> int:
@@ -116,6 +162,16 @@ def _aeros_etype(nids: list[int]) -> int:
     raise ValueError(f"No AERO-S shell type for {n}-node element")
 
 
+def _aeros_facetype(nids: list[int]) -> int:
+    """Map facet node count → AERO-S SURFACETOPO FACETYPE."""
+    n = len(nids)
+    if n == 3:
+        return 3       # 3-node triangle
+    if n == 4:
+        return 1       # 4-node quadrilateral
+    raise ValueError(f"No SURFACETOPO facetype for {n}-node facet")
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def write_aeros(
@@ -124,6 +180,7 @@ def write_aeros(
     config:      "ModelConfig | None" = None,
     sim:         SimConfig | None = None,
     beta_factor: float = 1.0,
+    contact:     "ContactConfig | None" = None,
 ) -> dict[str, Path]:
     """
     Write AERO-S include files for the fold surrogate.
@@ -138,6 +195,10 @@ def write_aeros(
     sim         : SimConfig — if provided, also writes MATERIAL.include and
                   fold.fem (the main AERO-S input file)
     beta_factor : revolute joint beta = penalty_stiffness * beta_factor
+    contact     : ContactConfig — if provided, writes SURFACETOPO.include and
+                  CONTACTSURFACES.include (whole surrogate as one self-contact
+                  surface) and, when `sim` is also given, adds their INCLUDE
+                  lines to fold.fem. Omit for identical output to before.
 
     Returns
     -------
@@ -193,6 +254,17 @@ def write_aeros(
             written["control_c"] = p
             print(f"  Wrote {p.name}")
 
+    if contact is not None:
+        p = out / "SURFACETOPO.include"
+        _write_surfacetopo(surrogate, contact, p)
+        written["surfacetopo"] = p
+        print(f"  Wrote {p.name}  ({len(surrogate.elements)} facets, surface {contact.surf_id})")
+
+        p = out / "CONTACTSURFACES.include"
+        _write_contactsurfaces(contact, p)
+        written["contactsurfaces"] = p
+        print(f"  Wrote {p.name}  (self-contact pair {contact.pair_id})")
+
     if sim is not None:
         p = out / "MATERIAL.include"
         _write_material(sim, surrogate.penalty_stiffness, cable_attr, p)
@@ -200,7 +272,7 @@ def write_aeros(
         print(f"  Wrote {p.name}")
 
         p = out / "fold.fem"
-        _write_input_file(sim, config, out, p)
+        _write_input_file(sim, config, contact, out, p)
         written["input"] = p
         print(f"  Wrote {p.name}")
 
@@ -451,20 +523,22 @@ void MyControl::usd_joint(double time, int mid, double *userDefineFunc,
 
 
 def _write_input_file(
-    sim:    SimConfig,
-    config: "ModelConfig | None",
-    out:    Path,
-    path:   Path,
+    sim:     SimConfig,
+    config:  "ModelConfig | None",
+    contact: "ContactConfig | None",
+    out:     Path,
+    path:    Path,
 ) -> None:
     """
     Write fold.fem — the main AERO-S input file.
 
-    INCLUDE lines for LMPC, USDF/LOAD, and DISP are omitted when the
-    corresponding config sections are empty or config is None.
+    INCLUDE lines for LMPC, USDF/LOAD, DISP and the self-contact surfaces are
+    omitted when the corresponding config sections are empty or None.
     """
     has_lmpc = config is not None and bool(config.lmpc_rows)
     has_disp = config is not None and bool(config.disp_bcs)
     has_usdf = config is not None and bool(config.force_bcs)
+    has_contact = contact is not None
 
     lines: list[str] = []
 
@@ -505,6 +579,11 @@ def _write_input_file(
         L('INCLUDE "./USDF.include"')
         L('LOAD "./control.so"')
     L(sep)
+    if has_contact:
+        L("* Self-contact: origami surrogate paired with itself (1-sided)")
+        L('INCLUDE "./SURFACETOPO.include"')
+        L('INCLUDE "./CONTACTSURFACES.include"')
+        L(sep)
     if has_disp:
         L("* DISP constraints (Dirichlet BCs)")
         L('INCLUDE "./DISP.include"')
@@ -562,6 +641,84 @@ def _write_eframes(rev_joints: list["JointInfo"], path: Path) -> None:
                 f"  {e2[0]:.6e} {e2[1]:.6e} {e2[2]:.6e}"
                 f"  {e3[0]:.6e} {e3[1]:.6e} {e3[2]:.6e}\n"
             )
+        f.write("*\n")
+
+
+def _write_surfacetopo(
+    surrogate: "Surrogate",
+    contact:   "ContactConfig",
+    path:      Path,
+) -> None:
+    """
+    Write SURFACETOPO.include — the whole shell surrogate as one contact surface.
+
+    Two transforms are applied to each shell facet:
+      1. Connectivity is remapped to original (pre-duplication) nodes via
+         Surrogate.node_origin, so panels that meet at a fold reference the same
+         crease-edge nodes. The surface is then watertight and ACME drops the
+         hinge-adjacent facet pairs from interaction testing (they share an
+         edge), which is exactly the spurious self-contact we want gone.
+      2. Winding is reversed when the facet's geometric normal opposes the
+         panel's outward normal (Surrogate.panel_normals), so every facet normal
+         points outward. A 1-sided surface (all we get under implicit dynamics)
+         only detects contact between facets whose normals oppose, so a
+         consistent outward orientation is required.
+
+    node_origin / panel_normals are read defensively: a Surrogate from an older
+    pickle without them still writes, just without the remap / flip.
+    """
+    origin  = getattr(surrogate, "node_origin", {}) or {}
+    normals = getattr(surrogate, "panel_normals", {}) or {}
+    off     = contact.face_id_offset
+
+    header = f"SURFACETOPO  {contact.surf_id}"
+    if contact.thickness > 0.0:
+        header += f"  SURFACE_THICKNESS  {contact.thickness:.6e}"
+
+    n_flipped = 0
+    with open(path, "w") as f:
+        f.write(header + "\n")
+        for eid in sorted(surrogate.elements):
+            _, nids = surrogate.elements[eid]
+            mapped  = [origin.get(n, n) for n in nids]
+
+            pid = surrogate.panel_map.get(eid)
+            pn  = normals.get(pid) if pid is not None else None
+            if pn is not None and len(mapped) >= 3:
+                p0 = np.asarray(surrogate.nodes[mapped[0]], float)
+                p1 = np.asarray(surrogate.nodes[mapped[1]], float)
+                p2 = np.asarray(surrogate.nodes[mapped[2]], float)
+                if float(np.dot(np.cross(p1 - p0, p2 - p0), np.asarray(pn, float))) < 0.0:
+                    mapped = list(reversed(mapped))
+                    n_flipped += 1
+
+            facetype = _aeros_facetype(mapped)
+            node_str = "  ".join(str(n) for n in mapped)
+            f.write(f"  {eid + off}  {facetype}  {node_str}\n")
+        f.write("*\n")
+
+    if n_flipped:
+        print(f"    ({n_flipped} facets re-wound outward)")
+
+
+def _write_contactsurfaces(contact: "ContactConfig", path: Path) -> None:
+    """
+    Write CONTACTSURFACES.include — self-contact of the origami surface.
+
+    Static / implicit-dynamic row (see AERO-S manual):
+        SURF_PAIR_ID#  MASTER  SLAVE  MORTAR_TYPE  NORMAL_TOL  TANGENTIAL_TOL
+    CONSTRAINT_METHOD is omitted so it inherits from the CONSTRAINTS command in
+    fold.fem. MASTER == SLAVE == contact.surf_id gives self-contact.
+    """
+    with open(path, "w") as f:
+        f.write("CONTACTSURFACES\n")
+        f.write(
+            f"  {contact.pair_id}"
+            f"  {contact.surf_id}  {contact.surf_id}"
+            f"  {contact.mortar_type}"
+            f"  {contact.normal_tol:.6e}"
+            f"  {contact.tangential_tol:.6e}\n"
+        )
         f.write("*\n")
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from pyaeroori import load_mesh, load_creases, Region, remesh, build_surrogate, write_aeros, SimConfig, add_physics, N
+from pyaeroori import load_mesh, load_creases, Region, remesh, build_surrogate, write_aeros, SimConfig, ContactConfig, add_physics, N
 from pyaeroori.plot import (
     mesh_stats,
     crease_stats,
@@ -194,7 +194,19 @@ sim = SimConfig(
     a_damp          = 1e-6,
     b_damp          = 1000.0,
 )
-write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim)
+# Optional: self-contact detection/enforcement on the origami surface.
+# Non-destructive — omit `contact=` for identical output. The whole surrogate
+# becomes one 1-sided surface paired with itself (see ContactConfig docstring
+# and docs/design_notes.md). Tune normal_tol to exceed the per-time-step motion
+# of the folding surface; raise it if AERO-S reports penetration.
+# contact = ContactConfig(
+#     normal_tol     = 0.1,
+#     tangential_tol = 1e-3,
+#     thickness      = 0.0,   # >0 lofts the surface +0.5*thickness along its normal
+# )
+contact = None
+
+write_aeros(surrogate, output_dir=output_dir, config=config, sim=sim, contact=contact)
 
 print(f"Done. Files written to {output_dir}")
 

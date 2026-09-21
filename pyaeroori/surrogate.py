@@ -65,6 +65,13 @@ class Surrogate:
     panel_map : element → panel_id (shell elements only; joints not included)
     penalty_stiffness  : global default penalty stiffness
     actuator_ramp_time : global default actuator ramp end time
+    node_origin   : duplicated crease node → original (pre-duplication) node ID.
+                    Non-duplicated nodes are absent (treat as identity). Used by
+                    writer.ContactConfig to build a watertight self-contact
+                    surface that shares crease edges instead of duplicate walls.
+    panel_normals : panel_id → unit outward normal (area-weighted). Used by the
+                    contact-surface writer to wind every facet outward, which a
+                    1-sided (implicit-dynamic) contact surface requires.
     """
     nodes:             dict[int, tuple[float, float, float]]
     elements:          dict[int, tuple[int, list[int]]]
@@ -73,6 +80,8 @@ class Surrogate:
     panel_colors:      dict[int, int]   # panel_id → 0 or 1 (BFS 2-coloring)
     penalty_stiffness: float
     actuator_ramp_time: float
+    node_origin:       dict[int, int]           = field(default_factory=dict)
+    panel_normals:     dict[int, "np.ndarray"]  = field(default_factory=dict)
 
     @property
     def revolute_joints(self) -> list[JointInfo]:
@@ -413,6 +422,11 @@ def build_surrogate(
             ))
             next_eid += 1
 
+    # node → original (pre-duplication) node. dup_map keys the owner panel to
+    # the original ID as well, so owners map to themselves; non-crease nodes are
+    # simply absent and callers treat a miss as identity.
+    node_origin: dict[int, int] = {nid: orig for (orig, _pid), nid in dup_map.items()}
+
     n_rev = sum(1 for j in joints if j.jtype == 126)
     n_sph = sum(1 for j in joints if j.jtype == 120)
     split_parts = []
@@ -431,6 +445,8 @@ def build_surrogate(
         panel_colors=panel_colors,
         penalty_stiffness=penalty_stiffness,
         actuator_ramp_time=actuator_ramp_time,
+        node_origin=node_origin,
+        panel_normals=panel_normals,
     )
 
 

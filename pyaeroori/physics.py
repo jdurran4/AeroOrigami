@@ -44,6 +44,7 @@ class NodeQuery:
 
         N.near(x, y, z, tol=0.1)           — nodes within tol of a point
         N.along_line(p1, p2, tol=0.1)      — nodes within tol of a segment
+        N.near_any(points, tol=0.1)        — nodes within tol of ANY point in a list
         N.all()                             — every node in the surrogate
         N.ids([1, 2, 3])                    — exact node IDs
 
@@ -64,6 +65,18 @@ class NodeQuery:
     def along_line(cls, p1, p2, tol: float = 1e-3) -> "NodeQuery":
         """Select nodes within perpendicular distance `tol` of segment p1→p2."""
         return cls("along_line", {"p1": tuple(p1), "p2": tuple(p2), "tol": tol})
+
+    @classmethod
+    def near_any(cls, points, tol: float = 1e-3) -> "NodeQuery":
+        """
+        Select nodes within `tol` of ANY point in `points`.
+
+        For scattered/curved point sets that aren't a single segment (so
+        along_line doesn't fit) — e.g. a crease line that bends across
+        multiple panels. Each point is matched independently, so a node near
+        two points in the list is still only counted once.
+        """
+        return cls("near_any", {"points": [tuple(p) for p in points], "tol": tol})
 
     @classmethod
     def all(cls) -> "NodeQuery":
@@ -137,6 +150,14 @@ class NodeQuery:
                     t  = max(0.0, min(1.0, float(t)))
                     dist = float(np.linalg.norm(pt - (p1 + t * seg)))
                 if dist <= tol:
+                    matched.append(nid)
+
+        elif self._mode == "near_any":
+            pts = [np.array(p, dtype=float) for p in self._params["points"]]
+            tol = self._params["tol"]
+            for nid, xyz in nodes.items():
+                pt = np.array(xyz)
+                if any(np.linalg.norm(pt - ref) <= tol for ref in pts):
                     matched.append(nid)
 
         matched.sort()
@@ -247,6 +268,12 @@ def add_physics(
                 ``{"type": "custom", "nid": int, "dof": int, "coeff": float,
                    "rhs": float, "nid2": int, "dof2": int, "coeff2": float}``
                   Single or two-term custom constraint. nid2/dof2/coeff2 optional.
+
+                ``{"type": "custom", "terms": [(nid, dof, coeff), ...], "rhs": float}``
+                  Arbitrary-length form — use when a constraint needs more
+                  than 2 terms, e.g. tying two nodes' linearized in-plane
+                  radius together (4 terms: x,y per node). Takes precedence
+                  over nid/dof/coeff if both are given.
 
     forces    : Point forces — list of (NodeQuery, (fx, fy, fz)) tuples.
                 Example::
@@ -466,14 +493,17 @@ def add_physics(
             print(f"  LMPC radial_motion delta={delta}: {count} nodes, {2*count} constraints added")
 
         elif ctype == "custom":
-            nid   = int(spec["nid"])
-            dof   = int(spec["dof"])
-            coeff = float(spec["coeff"])
-            rhs   = float(spec["rhs"])
-            terms = [(nid, dof, coeff)]
-            if "nid2" in spec:
-                terms.append((int(spec["nid2"]), int(spec["dof2"]),
-                               float(spec["coeff2"])))
+            rhs = float(spec["rhs"])
+            if "terms" in spec:
+                # Arbitrary-length form — e.g. tying two nodes' linearized
+                # in-plane radius together needs 4 terms (x,y per node),
+                # more than the nid/nid2 pair form below can express.
+                terms = [(int(n), int(d), float(c)) for n, d, c in spec["terms"]]
+            else:
+                terms = [(int(spec["nid"]), int(spec["dof"]), float(spec["coeff"]))]
+                if "nid2" in spec:
+                    terms.append((int(spec["nid2"]), int(spec["dof2"]),
+                                   float(spec["coeff2"])))
             config.lmpc_rows.append(LmpcRow(cid=cid, rhs=rhs, terms=terms))
             cid += 1
 

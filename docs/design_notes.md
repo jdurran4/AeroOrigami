@@ -173,6 +173,57 @@ manifold — the system is singular (observed error: "rank 10/20"). Use multiqua
 
 ---
 
+## Self-contact surface (ContactConfig)
+
+**Decision:** `write_aeros(..., contact=ContactConfig(...))` optionally emits
+`SURFACETOPO.include` + `CONTACTSURFACES.include`. The whole shell surrogate is
+one surface paired with itself. Off by default; omitting `contact` reproduces
+prior output byte-for-byte.
+
+**One-sided.** A 2-sided ("shell") contact surface requires explicit dynamics
+with `flagTDENFORCE On` plus a `SURFACETOPO` thickness attribute (AERO-S manual
+Note 5). The fold runs implicit dynamic (Newmark), so the surface is
+unavoidably 1-sided: contact is only detected between two facets whose normals
+point in *opposite* directions. Consequences — (a) facet winding must be
+consistent, see below; (b) a fold that closes two panels along a *mountain*
+crease brings their inner faces together with normals diverging, which 1-sided
+detection misses. Accepted for now; revisit if mountain-fold self-intersection
+becomes a real problem (options: reversed-winding duplicate facets, or moving
+the fold to explicit dynamics).
+
+**Facets are remapped to original (pre-duplication) nodes** via
+`Surrogate.node_origin`. Panels meeting at a crease then reference the same node
+chain along that crease, so the surface is watertight and ACME automatically
+excludes the hinge-adjacent facet slivers (they share an edge) from interaction
+testing — that sliver is exactly the spurious "always in contact" pair we want
+gone. The duplicated crease nodes are held coincident by their joints
+(`penalty_stiffness` 8e9), so building the contact surface on the original node
+tracks the true deformed structure to within the joint compliance. Cost: a
+hinge cannot self-detect being folded past flat, but the driver controls that
+angle anyway, and any genuinely flat fold still has plenty of non-edge-adjacent
+facet pairs across the two panels that do get caught.
+
+**Facets are wound outward** using `Surrogate.panel_normals` (the area-weighted
+outward normals already computed in `build_surrogate`): a facet whose winding
+normal opposes its panel normal is reversed before writing. Required because
+1-sided detection reads the facet normal from node order. Caveat: for a
+perfectly flat starting sheet the outward orientation from
+`_compute_panel_normals_centroids` is degenerate (dot of normal with an
+in-plane vector), so consistency there depends on `panel_outward_hints`; curved
+canopies are well-defined.
+
+**CONTACTSURFACES row** uses the static / implicit-dynamic form
+`SURF_PAIR_ID# MASTER SLAVE MORTAR_TYPE NORMAL_TOL TANGENTIAL_TOL`.
+`CONSTRAINT_METHOD` is omitted so it inherits from the `CONSTRAINTS` command in
+`fold.fem` (penalty, `SimConfig.lmpc_penalty`) — emitting `penalty` explicitly
+would force a `beta` value that has no default. `MASTER == SLAVE == surf_id`
+gives self-contact. Manual defaults are used for the tolerances
+(`NORMAL_TOL 0.1`, `TANGENTIAL_TOL 0.001`); `NORMAL_TOL` must exceed the
+distance a surface point moves in one time step, so raise it (or cut the time
+step) if AERO-S reports penetration.
+
+---
+
 ## Cable path reconstruction (Step 7)
 
 **Decision:** Cable intermediate nodes are NOT interpolated via RBF or
